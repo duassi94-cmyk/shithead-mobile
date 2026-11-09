@@ -185,10 +185,17 @@
         <!-- Placar Acumulado -->
         <div class="card-box">
           <div class="row">
-            <h2>Placar de Shitheads (Derrotas)</h2>
+            <h2>Placar 🏆</h2>
+            <div class="board-tabs">
+              <button class="board-tab active" data-board="session">Sessão da sala</button>
+              <button class="board-tab" data-board="general">Geral</button>
+            </div>
+          </div>
+          <div id="scoreboard-list"></div>
+          <div class="row">
+            <span id="lbl-board-note" class="board-note"></span>
             <button id="btn-reset-scores" class="btn btn-secondary" style="padding:4px 8px; font-size:0.72rem;">Zerar</button>
           </div>
-          <div id="scoreboard-list" style="font-size:0.82rem; color:var(--text-dim);">Nenhuma derrota registrada ainda.</div>
         </div>
 
         <!-- Histórico / Log da Última Sessão do Host para Ajuste da IA -->
@@ -261,7 +268,8 @@
         <button class="react-btn" data-emoji="😡">😡</button>
         <button class="react-btn" data-emoji="🔥">🔥</button>
         <button class="react-btn" data-emoji="💩">💩</button>
-        <button class="react-btn gombra-btn" data-emoji="GOMBRA">GOMBRA!</button>
+        <button class="react-btn gombra-btn" data-emoji="GOMBRA" disabled>GOMBRA!</button>
+        <button class="react-btn dormiu-btn" data-emoji="DORMIU" disabled>DORMIU??</button>
       </div>
 
       <!-- Zona do Jogador Local -->

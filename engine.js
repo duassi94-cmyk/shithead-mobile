@@ -313,8 +313,16 @@
         }
       }
 
+      // Log completo para exportar: partidas (só no host) + rede (host e convidados)
+      function getExport() {
+        const games = getSavedSession();
+        const net = NetLog.get();
+        if (!games && net.events.length === 0) return null;
+        return { appVersion: AppConfig.VERSION, exportedAt: new Date().toISOString(), ...(games || {}), network: net };
+      }
+
       function downloadLastSession() {
-        const data = getSavedSession();
+        const data = getExport();
         if (!data) return false;
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -336,8 +344,94 @@
         logMatchEnd,
         setMatchMode,
         getSavedSession,
+        getExport,
         downloadLastSession
       };
+    })();
+
+    /* ==========================================================================
+       3b. LOG DE CONEXÃO (NetLog)
+       Guarda eventos de rede (sala, conexões, quedas, reconexões, erros, rotas
+       WebRTC) em host E convidados, para diagnosticar problemas de conexão.
+       - Não grava endereços IP nem conteúdo de mensagens.
+       - Fila circular: mantém os últimos 600 eventos.
+       ========================================================================== */
+    const NetLog = (() => {
+      const KEY = 'sh_net_log_v1';
+      const MAX_EVENTS = 600;
+      let data = null;
+      let saveTimer = null;
+      const pageStart = Date.now();
+
+      function load() {
+        try {
+          const raw = Store.get(KEY);
+          data = raw ? JSON.parse(raw) : null;
+        } catch (e) {
+          data = null;
+        }
+        if (!data || !Array.isArray(data.events)) data = { events: [], counters: {} };
+        if (!data.counters) data.counters = {};
+      }
+
+      function save() {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+          try { Store.set(KEY, JSON.stringify(data)); } catch (e) {}
+        }, 400);
+      }
+
+      function log(ev, details = {}) {
+        if (!data) load();
+        data.events.push({ t: new Date().toISOString(), s: Math.round((Date.now() - pageStart) / 1000), ev, ...details });
+        if (data.events.length > MAX_EVENTS) data.events.splice(0, data.events.length - MAX_EVENTS);
+        save();
+      }
+
+      function count(name, n = 1) {
+        if (!data) load();
+        data.counters[name] = (data.counters[name] || 0) + n;
+        save();
+      }
+
+      function get() {
+        if (!data) load();
+        return data;
+      }
+
+      function clear() {
+        data = { events: [], counters: {} };
+        Store.remove(KEY);
+      }
+
+      // Informações do aparelho/rede (sem dados pessoais)
+      function environment() {
+        const c = navigator.connection || {};
+        const ua = navigator.userAgent || '';
+        const first = (pairs) => {
+          for (const [re, label] of pairs) {
+            const m = re.exec(ua);
+            if (m) return label + (m[1] ? ' ' + m[1] : '');
+          }
+          return 'outro';
+        };
+        const browser = first([[/Firefox\/(\d+)/, 'Firefox'], [/Edg\/(\d+)/, 'Edge'], [/SamsungBrowser\/(\d+)/, 'Samsung'], [/Chrome\/(\d+)/, 'Chrome'], [/Version\/(\d+).*Safari/, 'Safari']]);
+        const os = first([[/Android ([\d.]+)/, 'Android'], [/(?:iPhone|iPad).*?OS (\d+)/, 'iOS'], [/(Windows)/, ''], [/(Mac OS X)/, ''], [/(Linux)/, '']]).trim();
+        return {
+          browser,
+          os,
+          mobile: /Mobi|Android/i.test(ua),
+          online: navigator.onLine,
+          netType: c.effectiveType || null,
+          downlinkMbps: c.downlink || null,
+          rttMs: c.rtt || null,
+          saveData: !!c.saveData,
+          standalone: window.matchMedia ? window.matchMedia('(display-mode: standalone)').matches : false,
+          webrtc: !!window.RTCPeerConnection
+        };
+      }
+
+      return { log, count, get, clear, environment };
     })();
 
     /* ==========================================================================
@@ -638,6 +732,31 @@
         });
       }
 
+      // Despertador "trrrim-trrrim" para o DORMIU?? (toca só no aparelho de quem demora)
+      function alarm() {
+        if (muted) return;
+        init();
+        if (!ctx) return;
+        const now = ctx.currentTime;
+        for (let burst = 0; burst < 3; burst++) {
+          const start = now + burst * 0.42;
+          for (let k = 0; k < 10; k++) {
+            const t = start + k * 0.03;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(k % 2 ? 1568 : 1318.5, t);
+            gain.gain.setValueAtTime(0.0001, t);
+            gain.gain.exponentialRampToValueAtTime(0.12, t + 0.005);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.028);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(t);
+            osc.stop(t + 0.03);
+          }
+        }
+      }
+
       function playByTag(tag) {
         switch (tag) {
           case 'BURN10': burn10(); break;
@@ -652,7 +771,7 @@
         }
       }
 
-      return { init, toggleMute, updateMuteButtons, select, slide, power2, power7, invalidError, gombra, playByTag };
+      return { init, toggleMute, updateMuteButtons, select, slide, power2, power7, invalidError, gombra, alarm, playByTag };
     })();
 
     /* ==========================================================================

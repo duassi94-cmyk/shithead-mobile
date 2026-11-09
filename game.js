@@ -166,7 +166,63 @@
        ========================================================================== */
     let lastReactionAt = 0;
 
-    function showReaction(playerId, emoji) {
+    /* Janelas das interações especiais (medidas no relógio de cada aparelho,
+       a partir do momento em que ele viu o evento acontecer):
+       - GOMBRA!  : até 10 s depois que OUTRO jogador recolheu o monte
+       - DORMIU?? : quando o jogador da vez (humano, outro) passou de 10 s sem jogar */
+    const GOMBRA_WINDOW_MS = 10000;
+    const SLEEP_AFTER_MS = 10000;
+    const DORMIU_COOLDOWN_MS = 6000;
+    let seenPickupSeq = 0;
+    let pickupSeenAt = 0;
+    let turnKey = '';
+    let turnStartedAt = 0;
+    let lastDormiuAt = 0;
+
+    // Chamado a cada render: detecta compra nova do monte e troca de vez
+    function trackInteractionClocks() {
+      if (!G) return;
+      if ((G.pickupStamp || 0) !== seenPickupSeq) {
+        seenPickupSeq = G.pickupStamp || 0;
+        pickupSeenAt = seenPickupSeq ? Date.now() : 0;
+      }
+      const key = `${G.phase}|${G.turnIdx}|${G.turnCounter || 0}`;
+      if (key !== turnKey) {
+        turnKey = key;
+        turnStartedAt = Date.now();
+      }
+    }
+
+    function gombraRemainingMs() {
+      if (!G || !pickupSeenAt || G.lastPickupBy === myPlayerId) return 0;
+      return Math.max(0, GOMBRA_WINDOW_MS - (Date.now() - pickupSeenAt));
+    }
+
+    function sleepyPlayer() {
+      if (!G || G.phase !== 'PLAY') return null;
+      const p = G.players[G.turnIdx];
+      if (!p || p.id === myPlayerId || p.type !== 'human' || p.escaped) return null;
+      return Date.now() - turnStartedAt >= SLEEP_AFTER_MS ? p : null;
+    }
+
+    // Atualiza os botões GOMBRA! / DORMIU?? (contagem regressiva e liberação)
+    function refreshSpecialReactions() {
+      const gBtn = document.querySelector('.gombra-btn');
+      const dBtn = document.querySelector('.dormiu-btn');
+      if (!gBtn || !dBtn) return;
+      const left = gombraRemainingMs();
+      gBtn.disabled = left <= 0;
+      gBtn.textContent = left > 0 ? `GOMBRA! ${Math.ceil(left / 1000)}` : 'GOMBRA!';
+      gBtn.title = left > 0 ? 'Liberado: alguém acabou de recolher o monte!' : 'Liberado por 10 s quando outro jogador recolhe o monte';
+      const sleeper = sleepyPlayer();
+      const cooling = Date.now() - lastDormiuAt < DORMIU_COOLDOWN_MS;
+      dBtn.disabled = !sleeper || cooling;
+      dBtn.title = sleeper ? `Acordar ${sleeper.name}!` : 'Liberado quando o jogador da vez demora mais de 10 s';
+      dBtn.classList.toggle('dormiu-ready', !!sleeper && !cooling);
+    }
+    setInterval(refreshSpecialReactions, 250);
+
+    function showReaction(playerId, emoji, target = null) {
       const layer = document.getElementById('reaction-layer');
       const area = document.getElementById('table-area');
       if (!layer || !area) return;
@@ -191,6 +247,35 @@
         setTimeout(() => burst.remove(), 1900);
         return;
       }
+
+      if (emoji === 'DORMIU') {
+        const t = G ? G.players.find(pl => pl.id === target) : null;
+        const isMe = target === myPlayerId;
+        // Balão em cima de quem está demorando (ou no centro, se for você)
+        let tx = areaRect.width / 2;
+        let ty = areaRect.height * 0.45;
+        if (!isMe && target) {
+          const r = getSeatRect(target);
+          if (r) { tx = r.left + r.width / 2 - areaRect.left; ty = r.top - areaRect.top + 10; }
+        }
+        const burst = document.createElement('div');
+        burst.className = 'dormiu-burst' + (isMe ? ' dormiu-me' : '');
+        burst.style.left = `${tx}px`;
+        burst.style.top = `${ty}px`;
+        burst.innerHTML = `💤 DORMIU?? ⏰<small>${p ? p.name : ''}${t && !isMe ? ' → ' + t.name : ''}</small>`;
+        layer.appendChild(burst);
+        setTimeout(() => burst.remove(), isMe ? 2600 : 1800);
+        if (isMe) {
+          // O despertador toca só para quem está demorando (respeita o botão de mudo; a vibração vale sempre)
+          SoundEngine.alarm();
+          document.getElementById('player-zone')?.classList.add('wake-shake');
+          setTimeout(() => document.getElementById('player-zone')?.classList.remove('wake-shake'), 1200);
+          if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200, 100, 400]); } catch (e) {} }
+        } else {
+          SoundEngine.select();
+        }
+        return;
+      }
       for (let i = 0; i < 3; i++) {
         const el = document.createElement('div');
         el.className = 'float-emoji';
@@ -208,13 +293,25 @@
     function sendReaction(emoji) {
       const now = Date.now();
       if (now - lastReactionAt < 700) return; // evita spam
-      lastReactionAt = now;
-      if (isHost) {
-        showReaction(myPlayerId, emoji);
-        clientConns.forEach(c => c.send({ type: 'REACTION', playerId: myPlayerId, emoji }));
-      } else if (hostConn) {
-        hostConn.send({ type: 'REACTION', playerId: myPlayerId, emoji });
+      let target = null;
+      if (emoji === 'GOMBRA' && gombraRemainingMs() <= 0) return;
+      if (emoji === 'DORMIU') {
+        const sleeper = sleepyPlayer();
+        if (!sleeper || now - lastDormiuAt < DORMIU_COOLDOWN_MS) return;
+        target = sleeper.id;
+        lastDormiuAt = now;
       }
+      lastReactionAt = now;
+      const msg = { type: 'REACTION', playerId: myPlayerId, emoji, target };
+      if (isHost) {
+        showReaction(myPlayerId, emoji, target);
+        clientConns.forEach(c => netSend(c, msg));
+      } else if (hostConn) {
+        // O convidado vê na hora; o host repassa para os outros
+        showReaction(myPlayerId, emoji, target);
+        netSend(hostConn, msg);
+      }
+      refreshSpecialReactions();
     }
 
     // Bots também reagem de vez em quando (só o host decide)
@@ -224,18 +321,39 @@
       if (bots.length === 0) return;
       let pool = null;
       let chance = 0;
-      if (event === 'PICKUP' && count >= 6) { pool = ['😂', '😂', '💩', '🔥']; chance = 0.45; }
+      // GOMBRA! só vale logo depois de alguém recolher o monte
+      if (event === 'PICKUP') { pool = count >= 6 ? ['GOMBRA', 'GOMBRA', '😂', '💩'] : ['GOMBRA', '😂']; chance = count >= 6 ? 0.55 : 0.2; }
       else if (event === 'BURN') { pool = ['🔥', '😱']; chance = 0.25; }
       else if (event === 'JOKER') { pool = ['😱', '😡', '😂']; chance = 0.5; }
       else if (event === 'REVERSE') { pool = ['😱']; chance = 0.3; }
       if (!pool || Math.random() > chance) return;
       const bot = bots[Math.floor(Math.random() * bots.length)];
-      const emoji = Math.random() < 0.08 ? 'GOMBRA' : pool[Math.floor(Math.random() * pool.length)];
+      const emoji = pool[Math.floor(Math.random() * pool.length)];
       setTimeout(() => {
         showReaction(bot.id, emoji);
-        clientConns.forEach(c => c.send({ type: 'REACTION', playerId: bot.id, emoji }));
-      }, 450 + Math.random() * 600);
+        clientConns.forEach(c => netSend(c, { type: 'REACTION', playerId: bot.id, emoji }));
+      }, 450 + Math.random() * 2500);
     }
+
+    // Bots também cobram quem demora: depois de 12–18 s, às vezes um bot manda DORMIU??
+    let botDormiuKey = '';
+    setInterval(() => {
+      if (!isHost || !G || G.phase !== 'PLAY' || turboMode || coachOpen) return;
+      const p = G.players[G.turnIdx];
+      if (!p || p.type !== 'human' || p.escaped) return;
+      const key = `${G.turnIdx}|${G.turnCounter || 0}`;
+      if (key === botDormiuKey || Date.now() - turnStartedAt < 12000) return;
+      botDormiuKey = key;
+      if (Math.random() > 0.6) return;
+      const bots = G.players.filter(b => b.type === 'bot' && !b.escaped);
+      if (!bots.length) return;
+      const bot = bots[Math.floor(Math.random() * bots.length)];
+      setTimeout(() => {
+        if (!G || `${G.turnIdx}|${G.turnCounter || 0}` !== key) return; // já jogou
+        showReaction(bot.id, 'DORMIU', p.id);
+        clientConns.forEach(c => netSend(c, { type: 'REACTION', playerId: bot.id, emoji: 'DORMIU', target: p.id }));
+      }, Math.random() * 6000);
+    }, 1000);
 
     /* ==========================================================================
        LIMPEZA DE ESTADO VISUAL (sanitizeUIState)
@@ -275,14 +393,19 @@
     function refreshLogPanelUI() {
       const box = document.getElementById('box-session-log');
       const saved = LoggerModule.getSavedSession();
-      if (!saved || !saved.matches || saved.matches.length === 0 || !isHost) {
+      const net = NetLog.get();
+      const matches = saved && saved.matches ? saved.matches.length : 0;
+      // Mostra o log se houver partidas gravadas OU eventos de rede (convidados também)
+      if (matches === 0 && net.events.filter(e => e.ev !== 'app_start').length === 0) {
         box.style.display = 'none';
         return;
       }
       box.style.display = 'flex';
-      const totalTurns = saved.matches.reduce((acc, m) => acc + (m.turns ? m.turns.length : 0), 0);
+      const totalTurns = matches ? saved.matches.reduce((acc, m) => acc + (m.turns ? m.turns.length : 0), 0) : 0;
+      const problems = net.events.filter(e => /error|lost|timeout|slow|fail|gap/.test(e.ev)).length;
       document.getElementById('lbl-log-summary').textContent =
-        `Sessão registrada (${saved.matches.length} partida(s), ${totalTurns} jogadas gravadas). Baixe ou copie para trazer à conversa e ajustar a IA.`;
+        `${matches} partida(s), ${totalTurns} jogadas · ${net.events.length} evento(s) de conexão` +
+        (problems ? ` (${problems} com problema)` : '') + '. Baixe ou copie para trazer à conversa.';
     }
 
     function loadSavedSetup() {
@@ -356,32 +479,141 @@
       return rules;
     }
 
-    function getScores() {
+    /* ==========================================================================
+       PLACAR: histórico geral (neste aparelho) + sessão da sala
+       - Cada partida vira um registro com a ordem em que os jogadores escaparam.
+       - Jogadores são identificados pelo id do aparelho (trocar o nome não perde o histórico).
+       - Só pessoas entram no placar; simulação e tutorial não contam.
+       - Geral: cada aparelho guarda as partidas de que participou (host e convidados).
+       - Sessão: contada pelo host enquanto a sala estiver aberta e enviada a todos.
+       ========================================================================== */
+    const HISTORY_KEY = 'sh_history_v1';
+    const HISTORY_MAX = 500;
+    let sessionRecords = [];
+    let boardTab = 'session';
+
+    // O host aparece como 'local_host' na mesa; no histórico vale o id do aparelho dele
+    function canonicalId(id) {
+      return id === 'local_host' ? getDeviceId() : id;
+    }
+
+    function loadHistory() {
       try {
-        return JSON.parse(Store.get('sh_scores') || '{}');
+        const arr = JSON.parse(Store.get(HISTORY_KEY) || '[]');
+        return Array.isArray(arr) ? arr : [];
       } catch (e) {
-        return {};
+        return [];
       }
     }
 
-    function addLossScore(playerName) {
-      const sc = getScores();
-      sc[playerName] = (sc[playerName] || 0) - 1;
-      Store.set('sh_scores', JSON.stringify(sc));
-      renderScoreboard();
+    function addToHistory(record) {
+      const hist = loadHistory();
+      if (hist.some(r => r.matchId === record.matchId)) return; // já registrada
+      hist.push(record);
+      while (hist.length > HISTORY_MAX) hist.shift();
+      Store.set(HISTORY_KEY, JSON.stringify(hist));
+    }
+
+    function buildMatchRecord() {
+      const n = G.players.length;
+      const order = G.escapeOrder || [];
+      return {
+        matchId: `${getDeviceId()}_${Date.now().toString(36)}`,
+        at: new Date().toISOString(),
+        room: roomCode || null,
+        n,
+        players: G.players.map(p => {
+          const idx = order.indexOf(p.id);
+          return {
+            id: canonicalId(p.id),
+            name: p.name,
+            human: p.type === 'human' || !!p.disconnected,
+            place: p.id === G.loserId ? n : (idx === -1 ? n - 1 : idx + 1)
+          };
+        })
+      };
+    }
+
+    function computeStats(records) {
+      const stats = {};
+      records.forEach(rec => {
+        rec.players.forEach(p => {
+          if (!p.human) return;
+          const s = stats[p.id] || (stats[p.id] = { id: p.id, name: p.name, played: 0, losses: 0, firsts: 0, placeSum: 0, lastAt: '' });
+          s.played++;
+          if (p.place === rec.n) s.losses++;
+          if (p.place === 1) s.firsts++;
+          s.placeSum += p.place;
+          if (rec.at >= s.lastAt) { s.name = p.name; s.lastAt = rec.at; }
+        });
+      });
+      return Object.values(stats).sort((a, b) =>
+        (a.losses / a.played) - (b.losses / b.played) || b.played - a.played || b.firsts - a.firsts);
+    }
+
+    function avatarForId(id) {
+      const slot = lobbySlots.find(s => canonicalId(s.id) === id || s.id === id);
+      return slot ? slot.avatar : AvatarModule.getDefaultAvatar('human', null);
+    }
+
+    function leaderboardHtml(records, emptyText) {
+      const rows = computeStats(records);
+      if (rows.length === 0) return `<div class="board-empty">${emptyText}</div>`;
+      const me = getDeviceId();
+      return `<table class="board">
+        <thead><tr><th></th><th class="b-name">Jogador</th><th title="Partidas">P</th><th title="Vezes que foi o Shithead">💀</th><th title="% de derrotas">%</th><th title="Vezes que saiu em 1º">🥇</th><th title="Posição média de saída (1 = melhor)">Pos</th></tr></thead>
+        <tbody>${rows.map((s, i) => `
+          <tr class="${s.id === me ? 'b-me' : ''}">
+            <td class="b-rank">${i + 1}</td>
+            <td class="b-name"><img class="avatar-sm b-av" src="${avatarForId(s.id)}" alt="" /><span>${s.name}${s.id === me ? ' <em>(você)</em>' : ''}</span></td>
+            <td>${s.played}</td>
+            <td class="b-loss">${s.losses}</td>
+            <td>${Math.round((s.losses / s.played) * 100)}%</td>
+            <td>${s.firsts}</td>
+            <td>${(s.placeSum / s.played).toFixed(1)}</td>
+          </tr>`).join('')}</tbody></table>`;
     }
 
     function renderScoreboard() {
-      const sc = getScores();
-      const entries = Object.entries(sc).sort((a, b) => a[1] - b[1]);
       const el = document.getElementById('scoreboard-list');
-      if (entries.length === 0) {
-        el.innerHTML = 'Nenhuma derrota registrada ainda.';
-        return;
+      if (!el) return;
+      document.querySelectorAll('[data-board]').forEach(b => b.classList.toggle('active', b.dataset.board === boardTab));
+      const note = document.getElementById('lbl-board-note');
+      const resetBtn = document.getElementById('btn-reset-scores');
+      if (boardTab === 'session') {
+        el.innerHTML = leaderboardHtml(sessionRecords, 'Nenhuma partida nesta sessão ainda.');
+        note.textContent = (joinRoomCode ? `Sala ${joinRoomCode}` : (roomCode ? `Sala ${roomCode}` : 'Partidas locais')) + ` · ${sessionRecords.length} partida(s) · zera ao abrir uma sala nova`;
+        resetBtn.style.display = isHost ? 'inline-block' : 'none';
+      } else {
+        const hist = loadHistory();
+        el.innerHTML = leaderboardHtml(hist, 'Nenhuma partida registrada neste aparelho ainda.');
+        note.textContent = `${hist.length} partida(s) guardadas neste aparelho`;
+        resetBtn.style.display = 'inline-block';
       }
-      el.innerHTML = entries
-        .map(([name, pts]) => `<div class="row"><span>${name}</span><strong style="color:var(--danger);">${pts} pt(s)</strong></div>`)
-        .join('');
+    }
+
+    // Derrotas na sessão por jogador da mesa (para o 💀 ao lado de cada um)
+    function sessionLossesForTable() {
+      const out = {};
+      if (!G) return out;
+      G.players.forEach(p => {
+        const cid = canonicalId(p.id);
+        out[p.id] = sessionRecords.filter(r => r.players.some(x => x.id === cid && x.place === r.n)).length;
+      });
+      return out;
+    }
+
+    // Fim de partida (host): grava, atualiza a sessão e avisa todos os aparelhos
+    function recordMatchResult() {
+      if (!G || G.mode !== 'normal' || G.resultRecorded) return;
+      G.resultRecorded = true;
+      const record = buildMatchRecord();
+      if (!record.players.some(p => p.human)) return;
+      addToHistory(record);
+      sessionRecords.push(record);
+      G.sessionLosses = sessionLossesForTable();
+      clientConns.forEach(c => netSend(c, { type: 'MATCH_RESULT', record, session: sessionRecords }));
+      renderScoreboard();
     }
 
     function renderLobbySlots() {
@@ -485,9 +717,10 @@
     }
 
     function kickPlayer(pid) {
+      nlog('kick', { pid: shortId(pid) });
       clientConns.filter(c => c.__playerId === pid).forEach(c => {
         c.__kicked = true;
-        try { c.send({ type: 'KICKED' }); } catch (e) {}
+        try { netSend(c, { type: 'KICKED' }); } catch (e) {}
         setTimeout(() => { try { c.close(); } catch (e) {} }, 300);
       });
       for (let i = clientConns.length - 1; i >= 0; i--) {
@@ -521,6 +754,190 @@
     let joinRoomCode = '';
     let reconnectTimer = null;
 
+    /* ---- Envio confiável -------------------------------------------------------
+       Mensagens WebRTC acima de ~16 KB podem sumir em silêncio entre navegadores
+       diferentes (ex.: Firefox Android ↔ Chrome). Aqui toda mensagem grande é
+       dividida em pedaços pequenos e remontada do outro lado. */
+    const NET_CHUNK = 12000;
+    let netMsgSeq = 0;
+
+    /* ---- Log de conexão ---------------------------------------------------------
+       Tudo que acontece na rede vai para o NetLog (baixado junto com o log da sessão).
+       Ids aparecem encurtados (6 últimos caracteres); nada de IPs ou conteúdo. */
+    const shortId = (id) => (id ? String(id).slice(-6) : null);
+    function nlog(ev, details = {}) {
+      NetLog.log(ev, { role: isHost ? 'host' : 'guest', room: (isHost ? roomCode : joinRoomCode) || null, ...details });
+    }
+    function errInfo(err) {
+      return err ? { errType: err.type || err.name || null, errMsg: String(err.message || err).slice(0, 160) } : {};
+    }
+
+    // Estado ICE da ligação direta e qual rota foi usada (direta, via STUN ou via TURN/relay)
+    function watchPeerConnection(conn, who) {
+      const pc = conn && conn.peerConnection;
+      if (!pc || pc.__watched) return;
+      pc.__watched = true;
+      const report = () => reportRoute(pc, who);
+      pc.addEventListener('iceconnectionstatechange', () => {
+        nlog('ice_state', { who, state: pc.iceConnectionState });
+        NetLog.count('ice_' + pc.iceConnectionState);
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') report();
+      });
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') report();
+    }
+
+    async function reportRoute(pc, who) {
+      try {
+        const stats = await pc.getStats();
+        let pair = null;
+        stats.forEach(s => {
+          if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId) || pair;
+        });
+        if (!pair) stats.forEach(s => { if (s.type === 'candidate-pair' && (s.selected || (s.nominated && s.state === 'succeeded'))) pair = s; });
+        if (!pair) return;
+        const local = stats.get(pair.localCandidateId) || {};
+        const remote = stats.get(pair.remoteCandidateId) || {};
+        // host = rede local; srflx = direto pela internet (STUN); relay = passou pelo servidor TURN
+        nlog('route', {
+          who,
+          local: local.candidateType || null,
+          remote: remote.candidateType || null,
+          protocol: local.protocol || null,
+          relayProtocol: local.relayProtocol || null,
+          rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null
+        });
+        NetLog.count('route_' + (local.candidateType === 'relay' || remote.candidateType === 'relay' ? 'relay' : 'direct'));
+      } catch (e) { /* getStats indisponível */ }
+    }
+
+    function netSend(conn, msg) {
+      if (!conn || !conn.open) {
+        NetLog.count('send_skipped_closed');
+        return false;
+      }
+      const text = JSON.stringify(msg);
+      try {
+        if (text.length <= NET_CHUNK) {
+          conn.send(text);
+        } else {
+          const id = `${Date.now().toString(36)}_${netMsgSeq++}`;
+          const n = Math.ceil(text.length / NET_CHUNK);
+          for (let i = 0; i < n; i++) {
+            conn.send(JSON.stringify({ type: 'CHUNK', id, i, n, part: text.slice(i * NET_CHUNK, (i + 1) * NET_CHUNK) }));
+          }
+          NetLog.count('chunked_out');
+          if (text.length > 30000) nlog('big_message', { type: msg.type, bytes: text.length, parts: n });
+        }
+        NetLog.count('msg_out');
+        NetLog.count('bytes_out', text.length);
+        return true;
+      } catch (e) {
+        NetLog.count('send_fail');
+        nlog('send_fail', { type: msg && msg.type, bytes: text.length, ...errInfo(e) });
+        return false;
+      }
+    }
+
+    function netReceive(conn, raw, handler) {
+      let msg = raw;
+      if (typeof raw === 'string') {
+        NetLog.count('bytes_in', raw.length);
+        try { msg = JSON.parse(raw); } catch (e) { NetLog.count('parse_fail'); return; }
+      }
+      if (!msg || typeof msg !== 'object') return;
+      NetLog.count('msg_in');
+      if (msg.type === 'CHUNK') {
+        const buf = conn.__chunks || (conn.__chunks = {});
+        const entry = buf[msg.id] || (buf[msg.id] = { parts: new Array(msg.n), got: 0, at: Date.now() });
+        if (entry.parts[msg.i] === undefined) { entry.parts[msg.i] = msg.part; entry.got++; }
+        if (entry.got === msg.n) {
+          delete buf[msg.id];
+          NetLog.count('chunked_in');
+          try { handler(JSON.parse(entry.parts.join(''))); } catch (e) { NetLog.count('chunk_parse_fail'); }
+        }
+        // descarta pedaços órfãos antigos (mensagem que nunca completou)
+        Object.keys(buf).forEach(k => {
+          if (Date.now() - buf[k].at > 30000) {
+            nlog('chunk_lost', { got: buf[k].got, of: buf[k].parts.length });
+            NetLog.count('chunk_lost');
+            delete buf[k];
+          }
+        });
+        return;
+      }
+      handler(msg);
+    }
+
+    // Estado da partida sem as fotos (elas já vão no lobby): mensagem bem menor
+    function stateForNet() {
+      if (!G) return G;
+      G.version = (G.version || 0) + 1;
+      return {
+        ...G,
+        sessionLosses: sessionLossesForTable(),
+        loserAvatar: null,
+        players: G.players.map(p => ({ ...p, avatar: null }))
+      };
+    }
+
+    function restoreAvatars(state) {
+      const byId = {};
+      lobbySlots.forEach(s => { byId[s.id] = s.avatar; });
+      state.players.forEach(p => {
+        p.avatar = byId[p.id] || AvatarModule.getDefaultAvatar(p.type === 'bot' && p.persona ? 'bot' : 'human', p.persona);
+      });
+      if (state.loserId) {
+        const lp = state.players.find(p => p.id === state.loserId);
+        state.loserAvatar = lp ? lp.avatar : null;
+      }
+    }
+
+    /* ---- Pulso do host -----------------------------------------------------------
+       A cada 2,5 s o host avisa se está numa partida e qual a versão do estado.
+       Se o convidado perdeu alguma mensagem, ele pede a mesa de novo (RESYNC).
+       Se o convidado ficar 30 s sem ouvir o host, reconecta sozinho. */
+    let lastHostPingAt = 0;
+    let lastResyncAt = 0;
+
+    function hostInGame() {
+      return !!(G && G.phase !== 'ABANDONED' && document.getElementById('screen-game').classList.contains('active'));
+    }
+
+    setInterval(() => {
+      if (isHost && clientConns.length) {
+        const ping = { type: 'PING', inGame: hostInGame(), version: G ? (G.version || 0) : 0 };
+        clientConns.forEach(c => netSend(c, ping));
+      }
+      // 30 s de folga: navegadores "freiam" timers de abas em segundo plano no host
+      if (!isHost && joinRoomCode && hostConn && hostConn.open && lastHostPingAt && Date.now() - lastHostPingAt > 30000) {
+        nlog('ping_timeout', { gapS: Math.round((Date.now() - lastHostPingAt) / 1000) });
+        lastHostPingAt = 0;
+        handleHostLost('ping_timeout');
+      }
+    }, 2500);
+
+    function handlePing(ping) {
+      const gap = lastHostPingAt ? Date.now() - lastHostPingAt : 0;
+      if (gap > 8000) nlog('ping_gap', { gapS: Math.round(gap / 1000), hidden: document.hidden });
+      lastHostPingAt = Date.now();
+      const inGameHere = document.getElementById('screen-game').classList.contains('active');
+      const behind = ping.inGame && (!G || !inGameHere || (G.version || 0) < ping.version);
+      if (behind && Date.now() - lastResyncAt > 2000) {
+        lastResyncAt = Date.now();
+        nlog('resync_sent', { localV: G ? (G.version || 0) : null, hostV: ping.version, inGameHere });
+        NetLog.count('resync_sent');
+        netSend(hostConn, { type: 'RESYNC' });
+      }
+      // Host saiu da partida (voltou ao lobby) e eu ainda estou na mesa
+      if (!ping.inGame && inGameHere && G && G.phase !== 'GAMEOVER') {
+        nlog('host_left_game');
+        G = null;
+        document.getElementById('screen-game').classList.remove('active');
+        document.getElementById('screen-lobby').classList.add('active');
+        setNetStatus('join-net-status', 'O host voltou para a sala. Aguardando nova partida...', 'info');
+      }
+    }
+
     function getJoinUrl(code) {
       // Endereço oficial no GitHub Pages; em testes locais usa o endereço atual
       const base = window.location.origin + window.location.pathname.replace(/index\.html$/, '');
@@ -541,15 +958,37 @@
         if (on && 'wakeLock' in navigator && !wakeLock) {
           wakeLock = await navigator.wakeLock.request('screen');
           wakeLock.addEventListener('release', () => { wakeLock = null; });
+          nlog('wake_lock', { ok: true });
+        } else if (on && !('wakeLock' in navigator)) {
+          if (!keepScreenAwake.__warned) { keepScreenAwake.__warned = true; nlog('wake_lock', { ok: false, reason: 'sem suporte' }); }
         } else if (!on && wakeLock) {
           await wakeLock.release();
           wakeLock = null;
         }
-      } catch (e) { /* navegador sem suporte: segue sem */ }
+      } catch (e) {
+        nlog('wake_lock', { ok: false, ...errInfo(e) });
+      }
     }
+    // Tela apagada / app em segundo plano e internet caindo: causas comuns de queda
+    let hiddenAt = 0;
     document.addEventListener('visibilitychange', () => {
+      if (clientConns.length || joinRoomCode) {
+        if (document.hidden) {
+          hiddenAt = Date.now();
+          nlog('page_hidden');
+        } else {
+          nlog('page_visible', { awayS: hiddenAt ? Math.round((Date.now() - hiddenAt) / 1000) : null, connOpen: isHost ? clientConns.filter(c => c.open).length : !!(hostConn && hostConn.open) });
+        }
+      }
       if (!document.hidden && G && G.phase !== 'GAMEOVER' && (clientConns.length || hostConn)) keepScreenAwake(true);
     });
+    window.addEventListener('online', () => nlog('net_online', { netType: (navigator.connection || {}).effectiveType || null }));
+    window.addEventListener('offline', () => nlog('net_offline'));
+    if (navigator.connection && navigator.connection.addEventListener) {
+      navigator.connection.addEventListener('change', () => {
+        if (clientConns.length || joinRoomCode) nlog('net_change', { netType: navigator.connection.effectiveType || null, rttMs: navigator.connection.rtt || null });
+      });
+    }
 
     function peerErrorText(err) {
       const t = err && err.type;
@@ -580,16 +1019,22 @@
         renderLobbySlots();
       }
       roomCode = String(Math.floor(1000 + Math.random() * 9000));
+      if (attempt === 0) { sessionRecords = []; renderScoreboard(); } // sala nova = sessão nova
       setNetStatus('host-net-status', 'Criando sala...', 'info');
+      const t0 = Date.now();
+      nlog('room_create', { attempt, env: attempt === 0 ? NetLog.environment() : undefined });
       myPeer = new Peer(PEER_PREFIX + roomCode);
 
       myPeer.on('open', () => {
         renderHostInvite();
         setNetStatus('host-net-status', 'Sala aberta! Aguardando jogadores...', 'ok');
+        nlog('room_open', { ms: Date.now() - t0, server: myPeer.options && myPeer.options.host });
         LoggerModule.initNewSession(getRulesFromUI(), lobbySlots);
       });
 
       myPeer.on('error', (err) => {
+        nlog('peer_error', errInfo(err));
+        NetLog.count('peer_error_' + (err && err.type));
         // Código já em uso por outra sala: sorteia outro
         if (err.type === 'unavailable-id' && attempt < 5) { createHostRoom(attempt + 1); return; }
         setNetStatus('host-net-status', peerErrorText(err), 'error');
@@ -597,17 +1042,27 @@
 
       // Queda com o servidor de salas: as conexões já abertas continuam; tenta reabrir a sala
       myPeer.on('disconnected', () => {
+        nlog('server_disconnected', { guests: clientConns.length });
+        NetLog.count('server_disconnected');
         setNetStatus('host-net-status', 'Reconectando ao servidor de salas...', 'warn');
         setTimeout(() => { if (myPeer && !myPeer.destroyed) myPeer.reconnect(); }, 1500);
       });
 
       myPeer.on('connection', (conn) => {
+        const tc = Date.now();
+        nlog('guest_connecting', { peer: shortId(conn.peer) });
         conn.on('open', () => {
           clientConns.push(conn);
-          conn.on('data', (data) => handleHostReceive(conn, data));
+          nlog('guest_conn_open', { peer: shortId(conn.peer), ms: Date.now() - tc });
+          watchPeerConnection(conn, shortId(conn.peer));
+          conn.on('data', (d) => netReceive(conn, d, (m) => handleHostReceive(conn, m)));
         });
-        conn.on('close', () => handleClientLeft(conn));
-        conn.on('error', () => handleClientLeft(conn));
+        conn.on('close', () => { conn.__closeReason = conn.__closeReason || 'close'; handleClientLeft(conn); });
+        conn.on('error', (err) => {
+          conn.__closeReason = 'error';
+          nlog('guest_conn_error', { pid: shortId(conn.__playerId), ...errInfo(err) });
+          handleClientLeft(conn);
+        });
       });
     }
 
@@ -626,11 +1081,18 @@
       if (idx === -1) return;
       clientConns.splice(idx, 1);
       const pid = conn.__playerId;
+      const openedFor = conn.__openedAt ? Math.round((Date.now() - conn.__openedAt) / 1000) : null;
+      nlog('guest_conn_closed', {
+        pid: shortId(pid), reason: conn.__kicked ? 'kicked' : (conn.__replaced ? 'replaced' : (conn.__closeReason || 'close')),
+        connectedS: openedFor, ice: conn.peerConnection ? conn.peerConnection.iceConnectionState : null
+      });
       if (!pid || conn.__replaced || conn.__kicked) return;
       // O mesmo aparelho já voltou por outra conexão: não é uma saída
       if (clientConns.some(c => c.__playerId === pid)) return;
       const slot = lobbySlots.find(s => s.id === pid);
       const inGame = G && G.phase !== 'GAMEOVER' && G.phase !== 'ABANDONED' && G.players.some(p => p.id === pid);
+      nlog('guest_left', { pid: shortId(pid), name: slot ? slot.name : null, inGame: !!inGame, botTookOver: !!inGame });
+      NetLog.count('guest_left');
       if (inGame) {
         // Durante a partida: um bot assume o lugar até a pessoa voltar
         const p = G.players.find(pl => pl.id === pid);
@@ -673,30 +1135,56 @@
       setNetStatus('join-net-status', `Conectando à sala ${code}...`, 'info');
       document.getElementById('join-box').style.display = 'flex';
       document.getElementById('inp-room-code').value = code;
+      const t0 = Date.now();
+      joinAttempts++;
+      nlog('join_start', { attempt: joinAttempts, reason: lastLostReason || 'inicio', device: shortId(myPlayerId), env: joinAttempts === 1 ? NetLog.environment() : undefined });
       const peer = new Peer();
       myPeer = peer;
 
       peer.on('open', () => {
         if (peer !== myPeer) return;
+        nlog('peer_open', { ms: Date.now() - t0, server: peer.options && peer.options.host });
         const conn = peer.connect(PEER_PREFIX + code, CONN_OPTS);
         hostConn = conn;
         const timeout = setTimeout(() => {
-          if (!conn.open && conn === hostConn) setNetStatus('join-net-status', 'A conexão está demorando... Se não entrar, tente outra rede (Wi-Fi ↔ 4G).', 'warn');
+          if (!conn.open && conn === hostConn) {
+            nlog('conn_slow', { waitedS: 9, ice: conn.peerConnection ? conn.peerConnection.iceConnectionState : null });
+            NetLog.count('conn_slow');
+            setNetStatus('join-net-status', 'A conexão está demorando... Se não entrar, tente outra rede (Wi-Fi ↔ 4G).', 'warn');
+          }
         }, 9000);
+        // Acompanha o ICE desde o começo (mostra se a rede está bloqueando a ligação direta)
+        setTimeout(() => watchPeerConnection(conn, 'host'), 0);
         conn.on('open', () => {
           clearTimeout(timeout);
+          conn.__openedAt = Date.now();
+          nlog('conn_open', { ms: Date.now() - t0, attempt: joinAttempts });
+          watchPeerConnection(conn, 'host');
           const myName = document.getElementById('inp-name').value.trim() || 'Jogador';
           const avatar = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
-          conn.send({ type: 'JOIN', id: myPlayerId, name: myName, avatar });
+          netSend(conn, { type: 'JOIN', id: myPlayerId, name: myName, avatar, env: NetLog.environment() });
+          // Conta ao host por que precisou reconectar (fica no log dos dois lados)
+          if (joinAttempts > 1) netSend(conn, { type: 'NETLOG', what: 'reconnected', info: { attempt: joinAttempts, lastReason: lastLostReason } });
+          lastLostReason = null;
+          lastHostPingAt = Date.now();
           setNetStatus('join-net-status', `✔ Na sala ${code}! Aguardando o host iniciar.`, 'ok');
           setGuestLobbyMode(true);
         });
-        conn.on('data', (data) => { if (!conn.__stale) handleClientReceive(data); });
-        conn.on('close', () => { if (!conn.__stale) handleHostLost(); });
-        conn.on('error', () => { if (!conn.__stale) handleHostLost(); });
+        conn.on('data', (d) => { if (!conn.__stale) netReceive(conn, d, handleClientReceive); });
+        conn.on('close', () => { if (!conn.__stale) handleHostLost('conn_close'); });
+        conn.on('error', (err) => {
+          nlog('conn_error', { ...errInfo(err), stale: !!conn.__stale });
+          if (!conn.__stale) handleHostLost('conn_error');
+        });
+      });
+
+      peer.on('disconnected', () => {
+        if (peer === myPeer) nlog('server_disconnected', { connOpen: !!(hostConn && hostConn.open) });
       });
 
       myPeer.on('error', (err) => {
+        nlog('peer_error', errInfo(err));
+        NetLog.count('peer_error_' + (err && err.type));
         setNetStatus('join-net-status', peerErrorText(err), 'error');
         if (err.type === 'peer-unavailable') setGuestLobbyMode(false);
       });
@@ -707,12 +1195,21 @@
       if (document.hidden || isHost || !joinRoomCode) return;
       if (!hostConn || !hostConn.open) {
         clearTimeout(reconnectTimer);
+        lastLostReason = lastLostReason || 'voltou_da_espera';
         joinRoom(joinRoomCode);
       }
     });
 
-    function handleHostLost() {
+    let joinAttempts = 0;
+    let lastLostReason = null;
+
+    function handleHostLost(reason = 'desconhecido') {
       if (isHost || !joinRoomCode) return;
+      const openedFor = hostConn && hostConn.__openedAt ? Math.round((Date.now() - hostConn.__openedAt) / 1000) : null;
+      nlog('host_lost', { reason, connectedS: openedFor, hidden: document.hidden, online: navigator.onLine,
+        ice: hostConn && hostConn.peerConnection ? hostConn.peerConnection.iceConnectionState : null });
+      NetLog.count('host_lost_' + reason);
+      lastLostReason = reason;
       if (hostConn) hostConn.__stale = true;
       showInvalidWarning('Conexão com o host perdida. Tentando voltar...');
       setNetStatus('join-net-status', 'Conexão perdida. Tentando voltar à sala...', 'warn');
@@ -773,6 +1270,10 @@
       if (!data || typeof data !== 'object') return;
       if (data.type === 'JOIN') {
         conn.__playerId = data.id;
+        conn.__openedAt = conn.__openedAt || Date.now();
+        const rejoin = lobbySlots.some(s => s.id === data.id) || !!(G && G.players && G.players.some(p => p.id === data.id));
+        nlog('guest_join', { pid: shortId(data.id), name: String(data.name || '').slice(0, 14), rejoin, inGame: hostInGame(), env: data.env || null });
+        NetLog.count(rejoin ? 'guest_rejoin' : 'guest_join');
         // Mesmo aparelho reconectando: fecha a conexão antiga (sem tratar como saída)
         clientConns.forEach(c => {
           if (c !== conn && c.__playerId === data.id) {
@@ -811,17 +1312,18 @@
           if (lobbySlots.length < 6) lobbySlots.push(newSlot);
           else if (botIdx !== -1) lobbySlots[botIdx] = newSlot;
           else {
-            conn.send({ type: 'ROOM_FULL' });
+            netSend(conn, { type: 'ROOM_FULL' });
             return;
           }
         }
         renderLobbySlots();
         broadcastLobby();
+        netSend(conn, { type: 'SESSION', session: sessionRecords });
         setNetStatus('host-net-status', `${name} entrou na sala!`, 'ok');
         SoundEngine.select();
         // Quem entra durante uma partida recebe a mesa atual (como espectador se não estiver nela)
         if (G && G.phase !== 'ABANDONED' && document.getElementById('screen-game').classList.contains('active')) {
-          conn.send({ type: 'STATE_SYNC', state: G, fx: null });
+          netSend(conn, { type: 'STATE_SYNC', state: stateForNet(), fx: null });
         }
       } else if (data.type === 'PROFILE') {
         const slot = lobbySlots.find(s => s.id === conn.__playerId);
@@ -831,13 +1333,31 @@
           renderLobbySlots();
           broadcastLobby();
         }
+      } else if (data.type === 'NETLOG') {
+        // Convidado avisando de um problema que ele viu (ex.: reconectou)
+        nlog('guest_report', { pid: shortId(conn.__playerId), what: String(data.what || '').slice(0, 40), info: data.info || null });
+      } else if (data.type === 'RESYNC') {
+        nlog('resync_request', { pid: shortId(conn.__playerId) });
+        NetLog.count('resync_request');
+        // Convidado perdeu alguma mensagem: reenvia a mesa (ou o lobby)
+        if (hostInGame()) netSend(conn, { type: 'STATE_SYNC', state: stateForNet(), fx: null });
+        else netSend(conn, { type: 'LOBBY_SYNC', slots: lobbySlots });
       } else if (data.type === 'ACTION') {
         // Só aceita ações do próprio jogador daquela conexão
         if (conn.__playerId && data.playerId === conn.__playerId) executePlayerAction(data.playerId, data.action);
       } else if (data.type === 'REACTION') {
         if (data.playerId !== conn.__playerId) return;
-        showReaction(data.playerId, data.emoji);
-        clientConns.forEach(c => { if (c !== conn) c.send({ type: 'REACTION', playerId: data.playerId, emoji: data.emoji }); });
+        // O host confere as janelas (com uma folga de 2 s pela rede)
+        if (data.emoji === 'GOMBRA') {
+          const fresh = pickupSeenAt && Date.now() - pickupSeenAt < GOMBRA_WINDOW_MS + 2000;
+          if (!fresh || (G && G.lastPickupBy === data.playerId)) return;
+        }
+        if (data.emoji === 'DORMIU') {
+          const cur = G && G.phase === 'PLAY' ? G.players[G.turnIdx] : null;
+          if (!cur || cur.id !== data.target || Date.now() - turnStartedAt < SLEEP_AFTER_MS - 2000) return;
+        }
+        showReaction(data.playerId, data.emoji, data.target || null);
+        clientConns.forEach(c => { if (c !== conn) netSend(c, { type: 'REACTION', playerId: data.playerId, emoji: data.emoji, target: data.target || null }); });
       }
     }
 
@@ -846,8 +1366,24 @@
       if (data.type === 'LOBBY_SYNC') {
         lobbySlots = data.slots;
         renderLobbySlots();
+      } else if (data.type === 'PING') {
+        handlePing(data);
+      } else if (data.type === 'MATCH_RESULT') {
+        // Guarda no histórico deste aparelho as partidas de que participei
+        if (data.record && Array.isArray(data.record.players) && data.record.players.some(p => p.id === getDeviceId())) {
+          addToHistory(data.record);
+        }
+        if (Array.isArray(data.session)) sessionRecords = data.session;
+        renderScoreboard();
+        if (G) renderGame();
+      } else if (data.type === 'SESSION') {
+        if (Array.isArray(data.session)) sessionRecords = data.session;
+        renderScoreboard();
       } else if (data.type === 'STATE_SYNC') {
+        if (!data.state) return;
+        restoreAvatars(data.state);
         G = data.state;
+        lastHostPingAt = Date.now();
         document.getElementById('screen-lobby').classList.remove('active');
         document.getElementById('screen-game').classList.add('active');
         keepScreenAwake(G.phase !== 'GAMEOVER');
@@ -856,8 +1392,9 @@
         }
         renderGame();
       } else if (data.type === 'REACTION') {
-        showReaction(data.playerId, data.emoji);
+        showReaction(data.playerId, data.emoji, data.target || null);
       } else if (data.type === 'KICKED') {
+        nlog('kicked');
         joinRoomCode = '';
         if (hostConn) hostConn.__stale = true;
         resetToLocalLobby();
@@ -866,6 +1403,7 @@
         document.getElementById('screen-game').classList.remove('active');
         document.getElementById('screen-lobby').classList.add('active');
       } else if (data.type === 'ROOM_FULL') {
+        nlog('room_full');
         setNetStatus('join-net-status', 'A sala está cheia (6 jogadores).', 'error');
         joinRoomCode = '';
         setGuestLobbyMode(false);
@@ -873,14 +1411,14 @@
     }
 
     function broadcastLobby() {
-      clientConns.forEach(c => { try { c.send({ type: 'LOBBY_SYNC', slots: lobbySlots }); } catch (e) {} });
+      clientConns.forEach(c => { try { netSend(c, { type: 'LOBBY_SYNC', slots: lobbySlots }); } catch (e) {} });
     }
 
     function broadcastState(fx = null) {
       if (!isHost || clientConns.length === 0) return;
       // fromRect é coordenada da tela de quem jogou: não serve para os outros aparelhos
       const cleanFx = fx ? { ...fx, fromRect: undefined } : null;
-      clientConns.forEach(c => { try { c.send({ type: 'STATE_SYNC', state: G, fx: cleanFx }); } catch (e) {} });
+      clientConns.forEach(c => { try { netSend(c, { type: 'STATE_SYNC', state: stateForNet(), fx: cleanFx }); } catch (e) {} });
     }
 
     // Entrada direta pelo link/QR (?sala=1234)
@@ -898,7 +1436,7 @@
 
     function sendProfileToHost() {
       if (isHost || !hostConn || !hostConn.open) return;
-      hostConn.send({
+      netSend(hostConn, {
         type: 'PROFILE',
         name: document.getElementById('inp-name').value.trim() || 'Jogador',
         avatar: myCustomAvatar || AvatarModule.getDefaultAvatar('human', null)
@@ -1016,7 +1554,8 @@
         tieContext: null,
         loserName: null,
         mode: currentMode,
-        scores: getScores()
+        escapeOrder: [],
+        sessionLosses: {}
       };
 
       G.players.forEach((p, idx) => {
@@ -1173,7 +1712,7 @@
       if (isHost) {
         executePlayerAction(myPlayerId, action);
       } else if (hostConn) {
-        hostConn.send({ type: 'ACTION', playerId: myPlayerId, action });
+        netSend(hostConn, { type: 'ACTION', playerId: myPlayerId, action });
       }
     }
 
@@ -1234,6 +1773,8 @@
         });
 
         G.discard.forEach(c => { c.public = true; }); // todos viram o que foi recolhido
+        G.pickupStamp = Date.now() + Math.random();       // libera o GOMBRA! por 10 s
+        G.lastPickupBy = player.id;
         player.hand.push(...G.discard);
         G.discard = [];
         G.discardPlayGroups = [];
@@ -1274,6 +1815,8 @@
           });
 
           G.discard.forEach(c => { c.public = true; });
+          G.pickupStamp = Date.now() + Math.random();
+          G.lastPickupBy = player.id;
           player.hand.push(...G.discard);
           G.discard = [];
           G.discardPlayGroups = [];
@@ -1424,6 +1967,7 @@
       G.players.forEach(p => {
         if (!p.escaped && p.hand.length === 0 && p.open.length === 0 && p.closed.length === 0 && G.deck.length === 0) {
           p.escaped = true;
+          (G.escapeOrder || (G.escapeOrder = [])).push(p.id); // ordem de saída (1º, 2º, ...)
         }
       });
 
@@ -1446,8 +1990,7 @@
         G.loserAvatar = loser.avatar || AvatarModule.getDefaultAvatar(loser.type, loser.persona);
         G.loserId = loser.id;
         turboMode = false;
-        if (G.mode === 'normal') addLossScore(loser.name); // simulação e tutorial não contam
-        G.scores = getScores();
+        recordMatchResult(); // simulação e tutorial não contam
         LoggerModule.logMatchEnd(loser.name);
         const overFx = { kind: 'PLAY', actorId: player.id, cards: cardsPlayed, sfxTag: 'GAMEOVER' };
         triggerFlightVisual({ ...overFx, isMe: player.id === myPlayerId, fromRect });
@@ -1820,10 +2363,12 @@
     /* ==========================================================================
        11. RENDERIZAÇÃO: MESA REDONDA, PILHAS 3D, PLACAR E FIM DE JOGO
        ========================================================================== */
-    function scoreFor(name) {
-      const sc = (G && G.scores) || getScores();
-      const v = sc[name] || 0;
-      return v < 0 ? `💀 ${v}` : '';
+    // 💀 -X ao lado de cada jogador: derrotas nesta sessão da sala
+    function scoreFor(player) {
+      if (!player || (player.type === 'bot' && !player.disconnected)) return '';
+      const map = isHost ? sessionLossesForTable() : ((G && G.sessionLosses) || {});
+      const v = map[player.id] || 0;
+      return v > 0 ? `💀 -${v}` : '';
     }
 
     function renderTurnSequenceBar(meIdx) {
@@ -1902,7 +2447,7 @@
         seat.innerHTML = `
           <div class="seat-avatar-wrap">
             <img class="seat-avatar" src="${avatarSrc}" alt="" />
-            <span class="skull-badge">${scoreFor(p.name)}</span>
+            <span class="skull-badge">${scoreFor(p)}</span>
             <span class="seat-hand-pill" title="Cartas na mão">${p.hand.length}</span>
           </div>
           <div class="seat-name">${p.name}</div>
@@ -2012,6 +2557,7 @@
     function renderGame() {
       if (!G) return;
       sanitizeUIState();
+      trackInteractionClocks();
 
       // Espectador: simulação local, ou convidado que entrou com a partida já em andamento
       const outsider = !G.players.some(p => p.id === myPlayerId);
@@ -2056,7 +2602,7 @@
       document.getElementById('lbl-my-name-game').textContent = hideHand
         ? '👁 Você está assistindo — entra na próxima rodada'
         : (spectator ? `👁 Assistindo: ${me.name}` : me.name);
-      document.getElementById('lbl-my-score').textContent = spectator ? '' : scoreFor(me.name);
+      document.getElementById('lbl-my-score').textContent = spectator ? '' : scoreFor(me);
       document.getElementById('lbl-my-hand-count').textContent =
         me.escaped ? '✔ Você escapou!' : (isMyTurn ? `⚡ Sua vez · ${me.hand.length} na mão` : `🃏 ${me.hand.length} na mão`);
 
@@ -2167,15 +2713,23 @@
         document.getElementById('gameover-name').textContent = loserIsMe ? `${G.loserName} (você!)` : G.loserName;
         document.getElementById('gameover-text').textContent =
           G.mode === 'normal'
-            ? 'Sobrou com cartas por último e leva -1 no placar.'
+            ? (G.players.some(p => p.id === G.loserId && p.type === 'human') ? 'Sobrou com cartas por último e leva 💀 no placar.' : 'Sobrou com cartas por último! (bots não entram no placar)')
             : (G.mode === 'tutorial' ? 'Tutorial concluído! Agora você já sabe jogar. 🎉' : 'Simulação encerrada (não conta no placar).');
-        const sc = G.scores || {};
-        const rows = G.players
-          .map(p => ({ name: p.name, pts: sc[p.name] || 0, avatar: p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona) }))
-          .sort((a, b) => a.pts - b.pts)
-          .map(r => `<div class="row"><span style="display:flex;align-items:center;gap:6px;"><img class="avatar-sm" style="width:22px;height:22px;" src="${r.avatar}" alt="" />${r.name}</span><strong style="color:${r.pts < 0 ? 'var(--danger)' : 'var(--text-dim)'};">💀 ${r.pts}</strong></div>`)
-          .join('');
-        document.getElementById('gameover-scores').innerHTML = rows;
+        // Ordem de saída desta partida + placar da sessão
+        const medals = ['🥇', '🥈', '🥉'];
+        const order = [...(G.escapeOrder || [])];
+        G.players.forEach(p => { if (!order.includes(p.id) && p.id !== G.loserId) order.push(p.id); });
+        if (G.loserId) order.push(G.loserId);
+        const podium = order.map((id, i) => {
+          const p = G.players.find(pl => pl.id === id);
+          if (!p) return '';
+          const icon = id === G.loserId ? '💩' : (medals[i] || `${i + 1}º`);
+          const av = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
+          return `<div class="podium-item${id === G.loserId ? ' podium-loser' : ''}"><span class="podium-icon">${icon}</span><img class="avatar-sm" src="${av}" alt="" /><span class="podium-name">${p.name}</span></div>`;
+        }).join('');
+        document.getElementById('gameover-scores').innerHTML =
+          `<div class="podium">${podium}</div>` +
+          (G.mode === 'normal' ? `<div class="board-title">Placar da sessão</div>${leaderboardHtml(sessionRecords, 'O placar aparece após a primeira partida.')}` : '');
         document.getElementById('btn-rematch').style.display = isHost ? 'block' : 'none';
         if (!wasActive && navigator.vibrate && loserIsMe) { try { navigator.vibrate([80, 60, 160]); } catch (e) {} }
       } else {
@@ -2436,9 +2990,21 @@
       renderLobbySlots();
     });
 
+    document.querySelectorAll('[data-board]').forEach(btn => btn.addEventListener('click', () => {
+      boardTab = btn.dataset.board;
+      renderScoreboard();
+    }));
+
     document.getElementById('btn-reset-scores').addEventListener('click', () => {
       SoundEngine.select();
-      Store.remove('sh_scores');
+      if (boardTab === 'session') {
+        if (!isHost) return;
+        sessionRecords = [];
+        clientConns.forEach(c => netSend(c, { type: 'SESSION', session: sessionRecords }));
+      } else {
+        if (!window.confirm('Apagar todo o histórico de partidas guardado neste aparelho?')) return;
+        Store.remove(HISTORY_KEY);
+      }
       renderScoreboard();
     });
 
@@ -2448,7 +3014,7 @@
     });
 
     document.getElementById('btn-copy-log').addEventListener('click', () => {
-      const saved = LoggerModule.getSavedSession();
+      const saved = LoggerModule.getExport();
       if (!saved) return;
       navigator.clipboard.writeText(JSON.stringify(saved)).then(() => {
         const btn = document.getElementById('btn-copy-log');
@@ -2559,5 +3125,11 @@
 
     document.getElementById('btn-leave').addEventListener('click', returnToLobbyScreen);
     document.getElementById('btn-play-again').addEventListener('click', returnToLobbyScreen);
+
+    NetLog.log('app_start', { version: AppConfig.VERSION, device: getDeviceId().slice(-6), viaInvite: /[?&]sala=\d{4}/.test(location.search) });
+    // Mantém o resumo do log atualizado enquanto o lobby está aberto
+    setInterval(() => {
+      if (document.getElementById('screen-lobby').classList.contains('active')) refreshLogPanelUI();
+    }, 5000);
 
     loadSavedSetup();

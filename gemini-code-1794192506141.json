@@ -1,0 +1,20 @@
+{
+  "id": "shithead-mobile-v4",
+  "name": "Shithead! Mobile v4",
+  "short_name": "Shithead v4",
+  "description": "Jogo de cartas multiplayer P2P mobile e desktop (shithead-mobile-v4).",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1120",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230f172a'/><text x='50%25' y='58%25' dominant-baseline='middle' text-anchor='middle' font-size='56'>🃏</text></svg>",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

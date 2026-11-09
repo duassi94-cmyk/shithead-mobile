@@ -1,0 +1,2397 @@
+'use strict';
+    /* ==========================================================================
+       7. CONTROLADOR DE ESTADO E INTERFACE (GameApp)
+       ========================================================================== */
+    let myPeer = null;
+    let isHost = true;
+    let hostConn = null;
+    let clientConns = [];
+    let myPlayerId = 'local_host';
+    let roomCode = '';
+    let myCustomAvatar = Store.get('sh_player_avatar') || null;
+
+    let lobbySlots = [
+      { id: 'local_host', name: 'Você', type: 'human', persona: null, avatar: myCustomAvatar || AvatarModule.getDefaultAvatar('human', null) },
+      { id: 'bot_1', name: AppConfig.AI_PERSONAS.easy.name, type: 'bot', persona: 'easy', avatar: AvatarModule.getDefaultAvatar('bot', 'easy') },
+      { id: 'bot_2', name: AppConfig.AI_PERSONAS.medium.name, type: 'bot', persona: 'medium', avatar: AvatarModule.getDefaultAvatar('bot', 'medium') },
+      { id: 'bot_3', name: AppConfig.AI_PERSONAS.hard.name, type: 'bot', persona: 'hard', avatar: AvatarModule.getDefaultAvatar('bot', 'hard') }
+    ];
+
+    let G = null;
+    let selectedHandIds = new Set();
+    let selectedOpenIds = new Set();
+    let swapHandId = null;
+    let aiTimeout = null;
+    let speedLock = false;
+    let toastTimer = null;
+
+    function showInvalidWarning(msg, elementToShake = null) {
+      SoundEngine.invalidError();
+      const toast = document.getElementById('toast-warning');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove('show'), 2500);
+
+      const target = elementToShake || document.getElementById('discard-pile-visual');
+      if (target) {
+        target.classList.remove('shake-error');
+        void target.offsetWidth;
+        target.classList.add('shake-error');
+        setTimeout(() => target.classList.remove('shake-error'), 400);
+      }
+    }
+
+    function createCardDOM(card, isFaceDown = false) {
+      const el = document.createElement('div');
+      if (isFaceDown || !card) {
+        el.className = 'playing-card card-back';
+        return el;
+      }
+      const isFace = !card.isJoker && card.val >= 11 && card.val <= 13;
+      el.className = 'playing-card' + (card.isRed ? ' red' : '') + (card.isJoker ? ' joker-card' : '') + (isFace ? ' face-card' : '');
+      if (card.isJoker) {
+        el.innerHTML = `
+          <div class="card-corner"><span class="rank">★</span></div>
+          <div class="card-center">🃏</div>
+          <div class="card-corner-bot"><span class="rank">★</span></div>`;
+        return el;
+      }
+      const center = isFace ? `${card.label}${card.suit}` : card.suit;
+      el.innerHTML = `
+        <div class="card-corner"><span class="rank">${card.label}</span><span class="suit">${card.suit}</span></div>
+        <div class="card-center">${center}</div>
+        <div class="card-corner-bot"><span class="rank">${card.label}</span><span class="suit">${card.suit}</span></div>`;
+      return el;
+    }
+
+    // Número pseudo-aleatório estável por carta (o monte fica "bagunçado" sem tremer a cada render)
+    function cardJitter(card, salt = 0) {
+      const s = String(card && card.id || '') + salt;
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+      return ((h >>> 0) % 1000) / 1000; // 0..1
+    }
+
+    function animateCardFlight(fromRect, toRect, card, isFaceDown = false, duration = 340) {
+      if (!fromRect || !toRect) return;
+      const fxLayer = document.getElementById('fx-layer');
+      const flyingCard = createCardDOM(card, isFaceDown);
+      flyingCard.classList.add('flying-card');
+      flyingCard.style.position = 'fixed';
+      flyingCard.style.left = `${fromRect.left}px`;
+      flyingCard.style.top = `${fromRect.top}px`;
+      flyingCard.style.margin = '0';
+      flyingCard.style.zIndex = '999';
+      fxLayer.appendChild(flyingCard);
+
+      const dx = toRect.left - fromRect.left;
+      const dy = toRect.top - fromRect.top;
+      const spin = (Math.random() * 24 - 12).toFixed(1);
+
+      // Remoção garantida mesmo se a animação não rodar (aba em segundo plano etc.)
+      const killer = setTimeout(() => flyingCard.remove(), duration + 250);
+      try {
+        const anim = flyingCard.animate([
+          { transform: 'translate(0px, 0px) scale(1) rotate(0deg)', opacity: 1 },
+          { transform: `translate(${dx * 0.5}px, ${dy * 0.5 - 22}px) scale(1.1) rotate(${spin / 2}deg)`, opacity: 1, offset: 0.5 },
+          { transform: `translate(${dx}px, ${dy}px) scale(1) rotate(${spin}deg)`, opacity: 0.95 }
+        ], { duration, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' });
+        anim.onfinish = () => { clearTimeout(killer); flyingCard.remove(); };
+      } catch (e) {
+        flyingCard.remove();
+      }
+    }
+
+    function getSeatRect(playerId) {
+      if (playerId === myPlayerId) {
+        const el = document.getElementById('my-hand-cards');
+        return el ? el.getBoundingClientRect() : null;
+      }
+      const seat = document.querySelector(`.seat[data-seat-id="${CSS.escape(playerId || '')}"] .seat-avatar`);
+      if (seat) return seat.getBoundingClientRect();
+      const area = document.getElementById('opponents-area');
+      return area ? area.getBoundingClientRect() : null;
+    }
+
+    function triggerFlightVisual(fx) {
+      if (!fx) return;
+      if (turboMode) return; // acelerado: sem animações nem sons por jogada
+      if (fx.sfxTag) SoundEngine.playByTag(fx.sfxTag);
+
+      const discardEl = document.getElementById('discard-pile-visual');
+      const deckEl = document.getElementById('draw-pile-visual');
+      const burnedEl = document.getElementById('burned-pile-visual');
+      const discardRect = discardEl ? discardEl.getBoundingClientRect() : null;
+      const deckRect = deckEl ? deckEl.getBoundingClientRect() : null;
+      const actorRect = fx.actorId ? getSeatRect(fx.actorId) : null;
+      const handRect = getSeatRect(myPlayerId);
+
+      if (fx.kind === 'PLAY') {
+        const startRect = fx.fromRect || (fx.isMe ? handRect : actorRect);
+        if (startRect && discardRect) {
+          fx.cards.forEach((c, i) => {
+            setTimeout(() => animateCardFlight(startRect, discardRect, c, false, 330), i * 55);
+          });
+        }
+        if (fx.burned && burnedEl) {
+          setTimeout(() => {
+            burnedEl.classList.remove('burn-flash');
+            void burnedEl.offsetWidth;
+            burnedEl.classList.add('burn-flash');
+          }, 300);
+        }
+      } else if (fx.kind === 'PICKUP') {
+        const targetRect = fx.isMe ? handRect : actorRect;
+        if (discardRect && targetRect) {
+          for (let i = 0; i < Math.min(5, fx.count || 3); i++) {
+            setTimeout(() => animateCardFlight(discardRect, targetRect, null, true, 380), i * 60);
+          }
+        }
+      } else if (fx.kind === 'DRAW') {
+        const targetRect = fx.isMe ? handRect : (fx.actorId ? getSeatRect(fx.actorId) : null);
+        if (deckRect && targetRect) {
+          for (let i = 0; i < (fx.count || 1); i++) {
+            setTimeout(() => {
+              SoundEngine.slide();
+              animateCardFlight(deckRect, targetRect, null, true, 320);
+            }, i * 70);
+          }
+        }
+      }
+    }
+
+    /* ==========================================================================
+       REAÇÕES RÁPIDAS (emojis flutuantes + GOMBRA!)
+       ========================================================================== */
+    let lastReactionAt = 0;
+
+    function showReaction(playerId, emoji) {
+      const layer = document.getElementById('reaction-layer');
+      const area = document.getElementById('table-area');
+      if (!layer || !area) return;
+      const areaRect = area.getBoundingClientRect();
+      let x = areaRect.width / 2;
+      let y = areaRect.height - 10;
+      if (playerId !== myPlayerId) {
+        const r = getSeatRect(playerId);
+        if (r) {
+          x = r.left + r.width / 2 - areaRect.left;
+          y = r.top + r.height / 2 - areaRect.top;
+        }
+      }
+      const p = G ? G.players.find(pl => pl.id === playerId) : null;
+
+      if (emoji === 'GOMBRA') {
+        const burst = document.createElement('div');
+        burst.className = 'gombra-burst';
+        burst.innerHTML = `GOMBRA!<small>${p ? p.name : ''}</small>`;
+        layer.appendChild(burst);
+        SoundEngine.gombra();
+        setTimeout(() => burst.remove(), 1900);
+        return;
+      }
+      for (let i = 0; i < 3; i++) {
+        const el = document.createElement('div');
+        el.className = 'float-emoji';
+        el.textContent = emoji;
+        el.style.left = `${x + (i - 1) * 14}px`;
+        el.style.top = `${y}px`;
+        el.style.setProperty('--drift', `${(Math.random() * 60 - 30).toFixed(0)}px`);
+        el.style.animationDelay = `${i * 120}ms`;
+        layer.appendChild(el);
+        setTimeout(() => el.remove(), 1900 + i * 120);
+      }
+      SoundEngine.select();
+    }
+
+    function sendReaction(emoji) {
+      const now = Date.now();
+      if (now - lastReactionAt < 700) return; // evita spam
+      lastReactionAt = now;
+      if (isHost) {
+        showReaction(myPlayerId, emoji);
+        clientConns.forEach(c => c.send({ type: 'REACTION', playerId: myPlayerId, emoji }));
+      } else if (hostConn) {
+        hostConn.send({ type: 'REACTION', playerId: myPlayerId, emoji });
+      }
+    }
+
+    // Bots também reagem de vez em quando (só o host decide)
+    function maybeBotReact(actor, event, count = 0) {
+      if (!isHost || !G || turboMode || !event) return;
+      const bots = G.players.filter(p => p.type === 'bot' && p.id !== actor.id && !p.escaped);
+      if (bots.length === 0) return;
+      let pool = null;
+      let chance = 0;
+      if (event === 'PICKUP' && count >= 6) { pool = ['😂', '😂', '💩', '🔥']; chance = 0.45; }
+      else if (event === 'BURN') { pool = ['🔥', '😱']; chance = 0.25; }
+      else if (event === 'JOKER') { pool = ['😱', '😡', '😂']; chance = 0.5; }
+      else if (event === 'REVERSE') { pool = ['😱']; chance = 0.3; }
+      if (!pool || Math.random() > chance) return;
+      const bot = bots[Math.floor(Math.random() * bots.length)];
+      const emoji = Math.random() < 0.08 ? 'GOMBRA' : pool[Math.floor(Math.random() * pool.length)];
+      setTimeout(() => {
+        showReaction(bot.id, emoji);
+        clientConns.forEach(c => c.send({ type: 'REACTION', playerId: bot.id, emoji }));
+      }, 450 + Math.random() * 600);
+    }
+
+    /* ==========================================================================
+       LIMPEZA DE ESTADO VISUAL (sanitizeUIState)
+       Remove classes e elementos residuais que causam bugs gráficos.
+       ========================================================================== */
+    function sanitizeUIState() {
+      document.querySelectorAll('.dragging-source').forEach(el => el.classList.remove('dragging-source'));
+      document.querySelectorAll('.long-pressing').forEach(el => el.classList.remove('long-pressing'));
+      document.querySelectorAll('#fx-layer .drag-ghost').forEach(el => el.remove());
+      clearDropHighlights();
+      if (!G) return;
+      const me = G.players.find(p => p.id === myPlayerId);
+      if (!me || G.phase !== 'PLAY') {
+        selectedHandIds.clear();
+        selectedOpenIds.clear();
+      } else {
+        const handIds = new Set(me.hand.map(c => c.id));
+        const openIds = new Set(me.open.map(c => c.id));
+        [...selectedHandIds].forEach(id => { if (!handIds.has(id)) selectedHandIds.delete(id); });
+        [...selectedOpenIds].forEach(id => { if (!openIds.has(id)) selectedOpenIds.delete(id); });
+      }
+      if (G.phase !== 'SWAP') swapHandId = null;
+    }
+
+    function syncMyAvatarPreview() {
+      const src = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
+      document.getElementById('img-my-avatar').src = src;
+      if (isHost) {
+        lobbySlots[0].avatar = src;
+        renderLobbySlots();
+        broadcastLobby();
+      } else {
+        sendProfileToHost();
+      }
+    }
+
+    function refreshLogPanelUI() {
+      const box = document.getElementById('box-session-log');
+      const saved = LoggerModule.getSavedSession();
+      if (!saved || !saved.matches || saved.matches.length === 0 || !isHost) {
+        box.style.display = 'none';
+        return;
+      }
+      box.style.display = 'flex';
+      const totalTurns = saved.matches.reduce((acc, m) => acc + (m.turns ? m.turns.length : 0), 0);
+      document.getElementById('lbl-log-summary').textContent =
+        `Sessão registrada (${saved.matches.length} partida(s), ${totalTurns} jogadas gravadas). Baixe ou copie para trazer à conversa e ajustar a IA.`;
+    }
+
+    function loadSavedSetup() {
+      SoundEngine.updateMuteButtons();
+      const savedName = Store.get('sh_player_name');
+      if (savedName) {
+        document.getElementById('inp-name').value = savedName;
+        lobbySlots[0].name = savedName;
+      }
+      syncMyAvatarPreview();
+
+      const savedRules = Store.get('sh_rules');
+      if (savedRules) {
+        try {
+          const r = JSON.parse(savedRules);
+          document.getElementById('sel-decks').value = r.decks || '1';
+          document.getElementById('sel-jokers').value = r.jokers ?? '1';
+          document.getElementById('chk-p2').checked = r.p2 ?? true;
+          document.getElementById('sel-draw2').value = r.draw2 || '1';
+          document.getElementById('chk-p7').checked = r.p7 ?? true;
+          document.getElementById('chk-p10').checked = r.p10 ?? true;
+          document.getElementById('sel-after10').value = r.after10 || 'next';
+          document.getElementById('chk-pjoker').checked = r.pjoker ?? true;
+          document.getElementById('sel-multijoker').value = r.multijoker || 'once';
+          document.getElementById('chk-p48').checked = r.p48 ?? true;
+          document.getElementById('sel-48mode').value = r.mode48 || 'sequence';
+          document.getElementById('chk-48burn').checked = r.burn48 ?? false;
+        } catch (e) {}
+      }
+      renderScoreboard();
+      renderLobbySlots();
+      refreshLogPanelUI();
+
+      autoJoinFromUrl();
+    }
+
+    function getRulesFromUI() {
+      const playerCount = lobbySlots.length;
+      let decks = parseInt(document.getElementById('sel-decks').value, 10);
+      if (playerCount >= 6) {
+        decks = 2;
+        document.getElementById('sel-decks').value = '2';
+      }
+      let maxJokers = decks * 2;
+      let jokers = parseInt(document.getElementById('sel-jokers').value, 10);
+      if (jokers > maxJokers) {
+        jokers = maxJokers;
+        document.getElementById('sel-jokers').value = String(maxJokers);
+      }
+
+      // Coringa desligado = Coringa fora do baralho
+      const pjoker = document.getElementById('chk-pjoker').checked;
+      document.getElementById('sel-jokers').disabled = !pjoker;
+      if (!pjoker) jokers = 0;
+
+      const rules = {
+        decks,
+        jokers,
+        p2: document.getElementById('chk-p2').checked,
+        draw2: parseInt(document.getElementById('sel-draw2').value, 10),
+        p7: document.getElementById('chk-p7').checked,
+        p10: document.getElementById('chk-p10').checked,
+        after10: document.getElementById('sel-after10').value,
+        pjoker,
+        multijoker: document.getElementById('sel-multijoker').value,
+        p48: document.getElementById('chk-p48').checked,
+        mode48: document.getElementById('sel-48mode').value,
+        burn48: document.getElementById('chk-48burn').checked
+      };
+      Store.set('sh_rules', JSON.stringify(rules));
+      return rules;
+    }
+
+    function getScores() {
+      try {
+        return JSON.parse(Store.get('sh_scores') || '{}');
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function addLossScore(playerName) {
+      const sc = getScores();
+      sc[playerName] = (sc[playerName] || 0) - 1;
+      Store.set('sh_scores', JSON.stringify(sc));
+      renderScoreboard();
+    }
+
+    function renderScoreboard() {
+      const sc = getScores();
+      const entries = Object.entries(sc).sort((a, b) => a[1] - b[1]);
+      const el = document.getElementById('scoreboard-list');
+      if (entries.length === 0) {
+        el.innerHTML = 'Nenhuma derrota registrada ainda.';
+        return;
+      }
+      el.innerHTML = entries
+        .map(([name, pts]) => `<div class="row"><span>${name}</span><strong style="color:var(--danger);">${pts} pt(s)</strong></div>`)
+        .join('');
+    }
+
+    function renderLobbySlots() {
+      const container = document.getElementById('slots-container');
+      document.getElementById('lbl-player-count').textContent = lobbySlots.length;
+      if (lobbySlots.length >= 6) {
+        document.getElementById('sel-decks').value = '2';
+      }
+      container.innerHTML = '';
+
+      lobbySlots.forEach((slot, idx) => {
+        const div = document.createElement('div');
+        div.className = 'slot-item';
+        const avatarSrc = slot.avatar || AvatarModule.getDefaultAvatar(slot.type, slot.persona);
+
+        if (slot.type === 'human') {
+          div.innerHTML = `
+            <div class="slot-left">
+              <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
+              <img src="${avatarSrc}" class="avatar-sm" alt="${slot.name}" />
+              <strong>${slot.name}${slot.id === myPlayerId ? ' <span style="color:var(--cyan);font-weight:600;">(você)</span>' : ''}</strong>
+            </div>
+            <span class="badge">${idx === 0 ? 'Host' : 'Humano'}</span>
+          `;
+        } else {
+          div.innerHTML = `
+            <div class="slot-left">
+              <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
+              <img src="${avatarSrc}" class="avatar-sm" alt="${slot.name}" />
+              <strong>${slot.name}</strong>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              ${isHost ? `
+                <select data-idx="${idx}" class="sel-bot-persona" style="padding:3px 6px; font-size:0.74rem;">
+                  <option value="easy" ${slot.persona === 'easy' ? 'selected' : ''}>Tio Barnabé (Fácil)</option>
+                  <option value="medium" ${slot.persona === 'medium' ? 'selected' : ''}>Madame Lola (Médio)</option>
+                  <option value="hard" ${slot.persona === 'hard' ? 'selected' : ''}>Dr. Chaos (Difícil)</option>
+                  <option value="random">Aleatório</option>
+                </select>
+                ${lobbySlots.length > 3 ? `<button data-remove="${idx}" class="btn btn-danger" style="padding:3px 7px; font-size:0.72rem;">X</button>` : ''}
+              ` : `<span class="badge">IA</span>`}
+            </div>
+          `;
+        }
+        container.appendChild(div);
+      });
+
+      container.querySelectorAll('.sel-bot-persona').forEach(sel => {
+        sel.addEventListener('change', (e) => {
+          const i = parseInt(e.target.dataset.idx, 10);
+          let val = e.target.value;
+          if (val === 'random') {
+            const keys = ['easy', 'medium', 'hard'];
+            val = keys[Math.floor(Math.random() * keys.length)];
+          }
+          lobbySlots[i].persona = val;
+          lobbySlots[i].name = AppConfig.AI_PERSONAS[val].name;
+          lobbySlots[i].avatar = AvatarModule.getDefaultAvatar('bot', val);
+          renderLobbySlots();
+        });
+      });
+
+      container.querySelectorAll('[data-remove]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          if (lobbySlots.length <= 3) return;
+          const i = parseInt(e.target.dataset.remove, 10);
+          lobbySlots.splice(i, 1);
+          renderLobbySlots();
+        });
+      });
+    }
+
+    /* ==========================================================================
+       8. CONEXÃO MULTIPLAYER P2P (PeerJS / WebRTC)
+       - Sinalização: servidor público gratuito do PeerJS (0.peerjs.com). Ele só
+         apresenta os aparelhos; depois os dados vão direto de um para o outro.
+       - O Host é a "mesa": guarda o estado, roda os bots e valida as jogadas.
+       - Link/QR: ...?sala=1234 abre o jogo e entra direto na sala.
+       ========================================================================== */
+    const PEER_PREFIX = 'shithead-mobile-v5-sala-';
+    const CONN_OPTS = { reliable: true, serialization: 'json' };
+    let wakeLock = null;
+    let joinRoomCode = '';
+    let reconnectTimer = null;
+
+    function getJoinUrl(code) {
+      // Endereço oficial no GitHub Pages; em testes locais usa o endereço atual
+      const base = window.location.origin + window.location.pathname.replace(/index\.html$/, '');
+      return `${base}?sala=${code}`;
+    }
+
+    function setNetStatus(elId, text, kind = 'info') {
+      const el = document.getElementById(elId);
+      if (!el) return;
+      el.textContent = text;
+      el.className = 'net-status net-' + kind;
+      el.style.display = text ? 'block' : 'none';
+    }
+
+    // Mantém a tela acesa durante a partida (se o host apagar a tela, a sala cai)
+    async function keepScreenAwake(on) {
+      try {
+        if (on && 'wakeLock' in navigator && !wakeLock) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          wakeLock.addEventListener('release', () => { wakeLock = null; });
+        } else if (!on && wakeLock) {
+          await wakeLock.release();
+          wakeLock = null;
+        }
+      } catch (e) { /* navegador sem suporte: segue sem */ }
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && G && G.phase !== 'GAMEOVER' && (clientConns.length || hostConn)) keepScreenAwake(true);
+    });
+
+    function peerErrorText(err) {
+      const t = err && err.type;
+      if (t === 'peer-unavailable') return 'Sala não encontrada. Confira o código ou peça um novo link ao host.';
+      if (t === 'network' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed') return 'Sem conexão com o servidor de salas. Verifique a internet e tente de novo.';
+      if (t === 'browser-incompatible') return 'Este navegador não suporta jogo online (WebRTC).';
+      if (t === 'webrtc') return 'Não foi possível ligar os aparelhos diretamente (rede bloqueando). Tente outra rede (ex.: Wi-Fi ↔ 4G).';
+      return 'Erro de conexão: ' + (t || 'desconhecido');
+    }
+
+    function renderHostInvite() {
+      document.getElementById('host-qr-box').style.display = 'flex';
+      document.getElementById('join-box').style.display = 'none';
+      document.getElementById('lbl-room-code').textContent = roomCode;
+      const url = getJoinUrl(roomCode);
+      document.getElementById('lbl-invite-url').textContent = url.replace(/^https?:\/\//, '');
+      const qrEl = document.getElementById('qr-container');
+      qrEl.innerHTML = '';
+      new QRCode(qrEl, { text: url, width: 156, height: 156, correctLevel: QRCode.CorrectLevel.M });
+    }
+
+    function createHostRoom(attempt = 0) {
+      if (myPeer) myPeer.destroy();
+      isHost = true;
+      // "Você" só faz sentido na própria tela: online, o host precisa de um nome
+      if (!document.getElementById('inp-name').value.trim() && lobbySlots[0].name === 'Você') {
+        lobbySlots[0].name = 'Anfitrião';
+        renderLobbySlots();
+      }
+      roomCode = String(Math.floor(1000 + Math.random() * 9000));
+      setNetStatus('host-net-status', 'Criando sala...', 'info');
+      myPeer = new Peer(PEER_PREFIX + roomCode);
+
+      myPeer.on('open', () => {
+        renderHostInvite();
+        setNetStatus('host-net-status', 'Sala aberta! Aguardando jogadores...', 'ok');
+        LoggerModule.initNewSession(getRulesFromUI(), lobbySlots);
+      });
+
+      myPeer.on('error', (err) => {
+        // Código já em uso por outra sala: sorteia outro
+        if (err.type === 'unavailable-id' && attempt < 5) { createHostRoom(attempt + 1); return; }
+        setNetStatus('host-net-status', peerErrorText(err), 'error');
+      });
+
+      // Queda com o servidor de salas: as conexões já abertas continuam; tenta reabrir a sala
+      myPeer.on('disconnected', () => {
+        setNetStatus('host-net-status', 'Reconectando ao servidor de salas...', 'warn');
+        setTimeout(() => { if (myPeer && !myPeer.destroyed) myPeer.reconnect(); }, 1500);
+      });
+
+      myPeer.on('connection', (conn) => {
+        conn.on('open', () => {
+          clientConns.push(conn);
+          conn.on('data', (data) => handleHostReceive(conn, data));
+        });
+        conn.on('close', () => handleClientLeft(conn));
+        conn.on('error', () => handleClientLeft(conn));
+      });
+    }
+
+    function handleClientLeft(conn) {
+      const idx = clientConns.indexOf(conn);
+      if (idx === -1) return;
+      clientConns.splice(idx, 1);
+      const pid = conn.__playerId;
+      if (!pid) return;
+      const slot = lobbySlots.find(s => s.id === pid);
+      const inGame = G && G.phase !== 'GAMEOVER' && G.phase !== 'ABANDONED' && G.players.some(p => p.id === pid);
+      if (inGame) {
+        // Durante a partida: um bot assume o lugar até a pessoa voltar
+        const p = G.players.find(pl => pl.id === pid);
+        p.type = 'bot';
+        p.persona = 'medium';
+        p.readySwap = true;
+        p.disconnected = true;
+        G.bannerText = `${p.name} caiu — um bot está jogando por ele(a) até voltar.`;
+        if (G.phase === 'SWAP' && G.players.every(pl => pl.readySwap)) evaluateStartAndDirection();
+        broadcastState();
+        renderGame();
+        scheduleBotIfNeeded();
+      } else if (slot) {
+        lobbySlots = lobbySlots.filter(s => s.id !== pid);
+        renderLobbySlots();
+        broadcastLobby();
+      }
+      setNetStatus('host-net-status', `${slot ? slot.name : 'Um jogador'} saiu da sala.`, 'warn');
+    }
+
+    function joinRoom(code) {
+      code = String(code || '').replace(/\D/g, '').slice(0, 4);
+      if (code.length !== 4) {
+        setNetStatus('join-net-status', 'Digite o código de 4 números da sala.', 'error');
+        return;
+      }
+      SoundEngine.init();
+      joinRoomCode = code;
+      isHost = false;
+      // Mesmo id ao recarregar a página: o host devolve o seu lugar na mesa
+      const idKey = 'sh_peer_id_' + code;
+      myPlayerId = sessionStorage.getItem(idKey) || ('peer_' + Math.random().toString(36).substring(2, 9));
+      try { sessionStorage.setItem(idKey, myPlayerId); } catch (e) {}
+
+      if (myPeer) myPeer.destroy();
+      clearTimeout(reconnectTimer);
+      setNetStatus('join-net-status', `Conectando à sala ${code}...`, 'info');
+      document.getElementById('join-box').style.display = 'flex';
+      document.getElementById('inp-room-code').value = code;
+      myPeer = new Peer();
+
+      myPeer.on('open', () => {
+        hostConn = myPeer.connect(PEER_PREFIX + code, CONN_OPTS);
+        const timeout = setTimeout(() => {
+          if (!hostConn || !hostConn.open) setNetStatus('join-net-status', 'A conexão está demorando... Se não entrar, tente outra rede (Wi-Fi ↔ 4G).', 'warn');
+        }, 9000);
+        hostConn.on('open', () => {
+          clearTimeout(timeout);
+          const myName = document.getElementById('inp-name').value.trim() || 'Jogador';
+          const avatar = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
+          hostConn.send({ type: 'JOIN', id: myPlayerId, name: myName, avatar });
+          setNetStatus('join-net-status', `✔ Na sala ${code}! Aguardando o host iniciar.`, 'ok');
+          setGuestLobbyMode(true);
+        });
+        hostConn.on('data', (data) => handleClientReceive(data));
+        hostConn.on('close', () => handleHostLost());
+        hostConn.on('error', () => handleHostLost());
+      });
+
+      myPeer.on('error', (err) => {
+        setNetStatus('join-net-status', peerErrorText(err), 'error');
+        if (err.type === 'peer-unavailable') setGuestLobbyMode(false);
+      });
+    }
+
+    function handleHostLost() {
+      if (isHost || !joinRoomCode) return;
+      showInvalidWarning('Conexão com o host perdida. Tentando voltar...');
+      setNetStatus('join-net-status', 'Conexão perdida. Tentando voltar à sala...', 'warn');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => joinRoom(joinRoomCode), 2500);
+    }
+
+    // Convidado: esconde o que só o host controla
+    function setGuestLobbyMode(guest) {
+      document.getElementById('box-rules').style.display = guest ? 'none' : 'flex';
+      document.getElementById('btn-add-bot').style.display = guest ? 'none' : 'inline-block';
+      document.querySelector('.sim-row').style.display = guest ? 'none' : 'flex';
+      document.getElementById('btn-tutorial').style.display = guest ? 'none' : 'block';
+      document.getElementById('btn-create-host').disabled = guest;
+      const startBtn = document.getElementById('btn-start-match');
+      startBtn.disabled = guest;
+      startBtn.textContent = guest ? 'Aguardando o host iniciar...' : 'Iniciar Partida';
+    }
+
+    document.getElementById('btn-create-host').addEventListener('click', () => {
+      SoundEngine.init();
+      createHostRoom();
+    });
+
+    document.getElementById('btn-show-join').addEventListener('click', () => {
+      SoundEngine.init();
+      document.getElementById('join-box').style.display = 'flex';
+      document.getElementById('host-qr-box').style.display = 'none';
+      document.getElementById('inp-room-code').focus();
+    });
+
+    document.getElementById('btn-connect-peer').addEventListener('click', () => {
+      joinRoom(document.getElementById('inp-room-code').value);
+    });
+    document.getElementById('inp-room-code').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') joinRoom(e.target.value);
+    });
+
+    // Compartilhar convite (WhatsApp etc.) ou copiar o link
+    document.getElementById('btn-share-invite').addEventListener('click', async () => {
+      const url = getJoinUrl(roomCode);
+      const text = `Bora jogar Shithead! Sala ${roomCode}`;
+      try {
+        if (navigator.share) {
+          await navigator.share({ title: 'Shithead!', text, url });
+          return;
+        }
+      } catch (e) { if (e && e.name === 'AbortError') return; }
+      try {
+        await navigator.clipboard.writeText(url);
+        setNetStatus('host-net-status', 'Link copiado! Cole no WhatsApp ou onde quiser.', 'ok');
+      } catch (e) {
+        setNetStatus('host-net-status', url, 'info');
+      }
+    });
+
+    function handleHostReceive(conn, data) {
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'JOIN') {
+        conn.__playerId = data.id;
+        const name = String(data.name || 'Jogador').slice(0, 14);
+        const avatar = typeof data.avatar === 'string' && data.avatar.length < 60000 ? data.avatar : AvatarModule.getDefaultAvatar('human', null);
+
+        // Voltando para uma partida em andamento: devolve o lugar
+        const gp = G && G.phase !== 'ABANDONED' ? G.players.find(p => p.id === data.id) : null;
+        if (gp) {
+          gp.type = 'human';
+          gp.persona = null;
+          gp.disconnected = false;
+          gp.name = name;
+          G.bannerText = `${name} voltou para a mesa!`;
+          clearTimeout(aiTimeout);
+          broadcastState();
+          renderGame();
+          scheduleBotIfNeeded();
+        }
+
+        const existing = lobbySlots.find(s => s.id === data.id);
+        if (existing) {
+          existing.name = name;
+          existing.avatar = avatar;
+          existing.type = 'human';
+        } else {
+          const newSlot = { id: data.id, name, type: 'human', persona: null, avatar };
+          const botIdx = lobbySlots.findIndex(s => s.type === 'bot');
+          if (lobbySlots.length < 6) lobbySlots.push(newSlot);
+          else if (botIdx !== -1) lobbySlots[botIdx] = newSlot;
+          else {
+            conn.send({ type: 'ROOM_FULL' });
+            return;
+          }
+        }
+        renderLobbySlots();
+        broadcastLobby();
+        setNetStatus('host-net-status', `${name} entrou na sala!`, 'ok');
+        SoundEngine.select();
+        // Quem entra durante uma partida recebe a mesa atual (como espectador se não estiver nela)
+        if (G && G.phase !== 'ABANDONED' && document.getElementById('screen-game').classList.contains('active')) {
+          conn.send({ type: 'STATE_SYNC', state: G, fx: null });
+        }
+      } else if (data.type === 'PROFILE') {
+        const slot = lobbySlots.find(s => s.id === conn.__playerId);
+        if (slot) {
+          slot.name = String(data.name || slot.name).slice(0, 14);
+          if (typeof data.avatar === 'string' && data.avatar.length < 60000) slot.avatar = data.avatar;
+          renderLobbySlots();
+          broadcastLobby();
+        }
+      } else if (data.type === 'ACTION') {
+        // Só aceita ações do próprio jogador daquela conexão
+        if (conn.__playerId && data.playerId === conn.__playerId) executePlayerAction(data.playerId, data.action);
+      } else if (data.type === 'REACTION') {
+        if (data.playerId !== conn.__playerId) return;
+        showReaction(data.playerId, data.emoji);
+        clientConns.forEach(c => { if (c !== conn) c.send({ type: 'REACTION', playerId: data.playerId, emoji: data.emoji }); });
+      }
+    }
+
+    function handleClientReceive(data) {
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'LOBBY_SYNC') {
+        lobbySlots = data.slots;
+        renderLobbySlots();
+      } else if (data.type === 'STATE_SYNC') {
+        G = data.state;
+        document.getElementById('screen-lobby').classList.remove('active');
+        document.getElementById('screen-game').classList.add('active');
+        keepScreenAwake(G.phase !== 'GAMEOVER');
+        if (data.fx) {
+          triggerFlightVisual({ ...data.fx, isMe: data.fx.actorId === myPlayerId });
+        }
+        renderGame();
+      } else if (data.type === 'REACTION') {
+        showReaction(data.playerId, data.emoji);
+      } else if (data.type === 'ROOM_FULL') {
+        setNetStatus('join-net-status', 'A sala está cheia (6 jogadores).', 'error');
+        joinRoomCode = '';
+        setGuestLobbyMode(false);
+      }
+    }
+
+    function broadcastLobby() {
+      clientConns.forEach(c => { try { c.send({ type: 'LOBBY_SYNC', slots: lobbySlots }); } catch (e) {} });
+    }
+
+    function broadcastState(fx = null) {
+      if (!isHost || clientConns.length === 0) return;
+      // fromRect é coordenada da tela de quem jogou: não serve para os outros aparelhos
+      const cleanFx = fx ? { ...fx, fromRect: undefined } : null;
+      clientConns.forEach(c => { try { c.send({ type: 'STATE_SYNC', state: G, fx: cleanFx }); } catch (e) {} });
+    }
+
+    // Entrada direta pelo link/QR (?sala=1234)
+    function autoJoinFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      const sala = (params.get('sala') || '').replace(/\D/g, '');
+      if (sala.length !== 4) return;
+      document.getElementById('join-box').style.display = 'flex';
+      document.getElementById('inp-room-code').value = sala;
+      document.getElementById('join-invite-banner').style.display = 'block';
+      document.getElementById('lbl-invite-code').textContent = sala;
+      // Entra na hora; se o nome ainda for o padrão, dá para trocar depois (o host é avisado)
+      joinRoom(sala);
+    }
+
+    function sendProfileToHost() {
+      if (isHost || !hostConn || !hostConn.open) return;
+      hostConn.send({
+        type: 'PROFILE',
+        name: document.getElementById('inp-name').value.trim() || 'Jogador',
+        avatar: myCustomAvatar || AvatarModule.getDefaultAvatar('human', null)
+      });
+    }
+
+    /* ==========================================================================
+       9. FLUXO DA PARTIDA E EXECUÇÃO DE JOGADAS
+       ========================================================================== */
+    // Modo da partida: 'normal' | 'sim' (só bots, você assiste) | 'tutorial'
+    let currentMode = 'normal';
+    let turboMode = false;
+    let tutorialSeen = new Set();
+    let coachOpen = false;
+
+    function buildSlotsForMode(mode) {
+      if (mode === 'tutorial') {
+        return [
+          { ...lobbySlots[0] },
+          { id: 'tut_bot_1', name: 'Tio Barnabé', type: 'bot', persona: 'easy', avatar: AvatarModule.getDefaultAvatar('bot', 'easy') },
+          { id: 'tut_bot_2', name: 'Madame Lola', type: 'bot', persona: 'easy', avatar: AvatarModule.getDefaultAvatar('bot', 'medium') }
+        ];
+      }
+      if (mode === 'sim') {
+        // O seu lugar vira um bot; você assiste à mesa a partir dele
+        return lobbySlots.map(s => s.type === 'human'
+          ? { id: 'sim_' + s.id, name: 'Bot Espelho', type: 'bot', persona: 'hard', avatar: AvatarModule.getDefaultAvatar('bot', 'hard') }
+          : { ...s });
+      }
+      return lobbySlots.map(s => ({ ...s }));
+    }
+
+    // Tutorial: baralho combinado para as cartas especiais aparecerem logo
+    function rigTutorialDeck(deck) {
+      const take = (pred) => {
+        const i = deck.findIndex(pred);
+        return i === -1 ? null : deck.splice(i, 1)[0];
+      };
+      const pick = (val) => take(c => !c.isJoker && c.val === val);
+      // Jogador humano (assento 1): fechadas, abertas, mão
+      const humanClosed = [pick(9), pick(5), pick(13)];
+      const humanOpen = [pick(10), pick(14), pick(12)];
+      const humanHand = [pick(3), pick(7), pick(15)];
+      const human = [...humanClosed, ...humanOpen, ...humanHand];
+      // Bots com cartas medianas (sem 3 para o humano começar)
+      const botCards = [];
+      for (let b = 0; b < 2; b++) {
+        botCards.push([pick(4), pick(6), pick(8), pick(11), pick(9), pick(13), pick(5), pick(8), pick(6)]);
+      }
+      const joker = take(c => c.isJoker);
+      const rest = deck.splice(0);
+      // Coringa e um 10 perto do topo do monte de compra
+      const top = [pick.call(null, 4), joker, rest.find(c => c.val === 10) ? rest.splice(rest.findIndex(c => c.val === 10), 1)[0] : null]
+        .filter(Boolean);
+      const ordered = [...human, ...botCards[0], ...botCards[1], ...top, ...rest].filter(Boolean);
+      deck.push(...ordered);
+      return deck;
+    }
+
+    function startNewMatch(isRematch = false, mode = null) {
+      if (mode) currentMode = mode;
+      turboMode = false;
+      coachOpen = false;
+      document.getElementById('coach-bubble').classList.remove('show');
+      SoundEngine.init();
+      SoundEngine.slide();
+      const rules = currentMode === 'tutorial'
+        ? { decks: 1, jokers: 1, p2: true, draw2: 1, p7: true, p10: true, after10: 'next', pjoker: true, multijoker: 'once', p48: true, mode48: 'sequence', burn48: false }
+        : getRulesFromUI();
+      let deck = RulesEngine.buildDeck(rules);
+      const slots = buildSlotsForMode(currentMode);
+      if (currentMode === 'tutorial') deck = rigTutorialDeck(deck);
+
+      const players = slots.map((slot, idx) => {
+        const closed = deck.splice(0, 3);
+        const open = deck.splice(0, 3);
+        const hand = deck.splice(0, 3);
+        return {
+          id: slot.id,
+          seatNumber: idx + 1,
+          name: slot.name,
+          type: slot.type,
+          persona: slot.persona,
+          avatar: slot.avatar || AvatarModule.getDefaultAvatar(slot.type, slot.persona),
+          closed,
+          open,
+          hand,
+          readySwap: slot.type === 'bot',
+          escaped: false
+        };
+      });
+
+      if (!isRematch) {
+        LoggerModule.initNewSession(rules, players);
+      }
+      LoggerModule.startMatchLog(rules, players);
+      LoggerModule.setMatchMode(currentMode);
+
+      G = {
+        rules,
+        deck,
+        discard: [],
+        discardPlayGroups: [], // Guarda os grupos das jogadas feitas no monte atual
+        burnedCount: 0,        // Cartas eliminadas (queimadas) fora de jogo
+        players,
+        phase: 'SWAP',
+        turnIdx: 0,
+        direction: 1,
+        constraint7: false,
+        freePlayAfterJoker: false,
+        freePlayAfter2: false,
+        bannerText: currentMode === 'sim'
+          ? 'Simulação: os bots estão se preparando...'
+          : 'Preparação: toque numa carta da mão e depois numa aberta da mesa para trocar',
+        tieContext: null,
+        loserName: null,
+        mode: currentMode,
+        scores: getScores()
+      };
+
+      G.players.forEach((p, idx) => {
+        if (p.type === 'bot') AIEngine.performInitialSwap(G, idx);
+      });
+
+      selectedHandIds.clear();
+      selectedOpenIds.clear();
+      swapHandId = null;
+
+      document.getElementById('screen-lobby').classList.remove('active');
+      document.getElementById('screen-game').classList.add('active');
+      document.getElementById('modal-gameover').classList.remove('active');
+      document.getElementById('modal-speed').classList.remove('active');
+
+      broadcastState({ kind: 'SLIDE_INIT', sfxTag: 'SLIDE' });
+      renderGame();
+
+      // Todos são bots (simulação): começa sozinho após a preparação
+      if (G.players.every(p => p.readySwap)) {
+        setTimeout(() => { if (G && G.phase === 'SWAP') evaluateStartAndDirection(); }, 900);
+      }
+    }
+
+    function evaluateStartAndDirection() {
+      const lowestPerPlayer = G.players.map((p, idx) => {
+        const minVal = Math.min(...p.hand.map(c => c.val));
+        return { idx, minVal };
+      });
+
+      const globalMin = Math.min(...lowestPerPlayer.map(x => x.minVal));
+      const tiedFirst = lowestPerPlayer.filter(x => x.minVal === globalMin).map(x => x.idx);
+
+      if (tiedFirst.length > 1) {
+        triggerSpeedTie('FIRST', tiedFirst, globalMin, null);
+      } else {
+        resolveSecondLowestDirection(tiedFirst[0]);
+      }
+    }
+
+    function resolveSecondLowestDirection(firstIdx) {
+      const others = G.players
+        .map((p, idx) => ({ idx, minVal: Math.min(...p.hand.map(c => c.val)) }))
+        .filter(x => x.idx !== firstIdx);
+
+      const secondMin = Math.min(...others.map(x => x.minVal));
+      const tiedSecond = others.filter(x => x.minVal === secondMin).map(x => x.idx);
+
+      if (tiedSecond.length > 1) {
+        triggerSpeedTie('SECOND', tiedSecond, secondMin, firstIdx);
+      } else {
+        finalizeDirectionAndStart(firstIdx, tiedSecond[0]);
+      }
+    }
+
+    function finalizeDirectionAndStart(firstIdx, secondIdx) {
+      const n = G.players.length;
+      const cwDist = (secondIdx - firstIdx + n) % n;
+      const ccwDist = (firstIdx - secondIdx + n) % n;
+      G.direction = cwDist <= ccwDist ? 1 : -1;
+      G.turnIdx = firstIdx;
+      G.phase = 'PLAY';
+      G.tieContext = null;
+      const dirName = G.direction === 1 ? 'Horário' : 'Anti-Horário';
+      G.bannerText = `${G.players[firstIdx].name} começa! (Sentido ${dirName})`;
+      SoundEngine.power2();
+      broadcastState();
+      renderGame();
+      scheduleBotIfNeeded();
+    }
+
+    function triggerSpeedTie(role, candidates, cardVal, fixedFirstIdx) {
+      G.phase = 'SPEED_TIE';
+      const rankObj = AppConfig.RANKS.find(r => r.val === cardVal);
+      const label = rankObj ? rankObj.label : 'Coringa';
+      G.tieContext = { role, candidates, cardVal, label, fixedFirstIdx };
+      speedLock = false;
+      SoundEngine.power7();
+      broadcastState();
+      renderGame();
+
+      candidates.forEach(cIdx => {
+        const p = G.players[cIdx];
+        if (p.type === 'bot') {
+          const delay = 750 + Math.random() * 1350;
+          setTimeout(() => {
+            if (G && G.phase === 'SPEED_TIE' && !speedLock) {
+              handleSpeedTieWin(cIdx);
+            }
+          }, delay);
+        }
+      });
+    }
+
+    function handleSpeedTieWin(winnerIdx) {
+      if (!G || G.phase !== 'SPEED_TIE' || speedLock) return;
+      if (!G.tieContext.candidates.includes(winnerIdx)) return;
+      speedLock = true;
+
+      if (G.tieContext.role === 'FIRST') {
+        resolveSecondLowestDirection(winnerIdx);
+      } else {
+        finalizeDirectionAndStart(G.tieContext.fixedFirstIdx, winnerIdx);
+      }
+    }
+
+    function attemptLocalPlay(handIds, openIds, fromRect = null) {
+      if (!G || G.phase !== 'PLAY') return false;
+      const me = G.players.find(p => p.id === myPlayerId) || G.players[0];
+      const myIdx = G.players.indexOf(me);
+
+      if (G.turnIdx !== myIdx) {
+        showInvalidWarning('Aguarde a sua vez de jogar!');
+        return false;
+      }
+
+      const handChosen = me.hand.filter(c => handIds.includes(c.id));
+      const openChosen = me.open.filter(c => openIds.includes(c.id));
+      const allChosen = [...handChosen, ...openChosen];
+
+      if (allChosen.length === 0) {
+        showInvalidWarning('Selecione pelo menos uma carta para jogar!');
+        return false;
+      }
+
+      const firstVal = allChosen[0].val;
+      if (!allChosen.every(c => c.val === firstVal)) {
+        showInvalidWarning('As cartas jogadas juntas devem ter o mesmo valor!');
+        return false;
+      }
+
+      if (handChosen.length === 0 && me.hand.length > 0) {
+        showInvalidWarning('Você precisa acabar com as cartas da mão antes de jogar as da mesa!');
+        return false;
+      }
+
+      if (handChosen.length > 0 && openChosen.length > 0) {
+        if (G.deck.length > 0 || handChosen.length !== me.hand.length) {
+          showInvalidWarning('Só é possível combinar cartas da mesa com a última jogada da mão quando o baralho zerar!');
+          return false;
+        }
+      }
+
+      if (!RulesEngine.isCardPlayable(G, allChosen[0])) {
+        showInvalidWarning(RulesEngine.getInvalidMoveReason(G, allChosen[0]));
+        return false;
+      }
+
+      sendOrExecuteAction({ type: 'PLAY_CARDS', handIds, openIds, fromRect });
+      return true;
+    }
+
+    function sendOrExecuteAction(action) {
+      if (isHost) {
+        executePlayerAction(myPlayerId, action);
+      } else if (hostConn) {
+        hostConn.send({ type: 'ACTION', playerId: myPlayerId, action });
+      }
+    }
+
+    function executePlayerAction(playerId, action) {
+      const pIdx = G.players.findIndex(p => p.id === playerId);
+      if (pIdx === -1) return;
+      const player = G.players[pIdx];
+
+      if (action.type === 'SWAP_CARDS' && G.phase === 'SWAP') {
+        const hIdx = player.hand.findIndex(c => c.id === action.handId);
+        const oIdx = player.open.findIndex(c => c.id === action.openId);
+        if (hIdx !== -1 && oIdx !== -1) {
+          const temp = player.hand[hIdx];
+          player.hand[hIdx] = player.open[oIdx];
+          player.open[oIdx] = temp;
+          SoundEngine.slide();
+        }
+        broadcastState({ kind: 'SWAP', sfxTag: 'SLIDE' });
+        renderGame();
+        return;
+      }
+
+      if (action.type === 'READY_SWAP' && G.phase === 'SWAP') {
+        player.readySwap = true;
+        LoggerModule.logSwap(player, player.open, player.hand);
+        SoundEngine.select();
+        if (G.players.every(p => p.readySwap)) {
+          evaluateStartAndDirection();
+        } else {
+          broadcastState();
+          renderGame();
+        }
+        return;
+      }
+
+      if (action.type === 'SPEED_TAP' && G.phase === 'SPEED_TIE') {
+        handleSpeedTieWin(pIdx);
+        return;
+      }
+
+      if (G.phase !== 'PLAY' || pIdx !== G.turnIdx) return;
+
+      if (action.type === 'PICKUP_PILE') {
+        const check = RulesEngine.canPlayerPickupPile(G, player);
+        if (!check.allowed) return;
+
+        const count = G.discard.length;
+        const topBefore = count > 0 ? G.discard[count - 1].label + G.discard[count - 1].suit : 'Vazio';
+
+        LoggerModule.logTurn({
+          player: player.name,
+          persona: player.persona || 'human',
+          action: check.forcedByNoMove ? 'PICKUP_NO_MOVE_WITH_JOKER' : 'PICKUP_PILE',
+          handBefore: player.hand.map(c => c.label + c.suit),
+          openBefore: player.open.map(c => c.label + c.suit),
+          discardTopBefore: topBefore,
+          discardCountBefore: count
+        });
+
+        G.discard.forEach(c => { c.public = true; }); // todos viram o que foi recolhido
+        player.hand.push(...G.discard);
+        G.discard = [];
+        G.discardPlayGroups = [];
+        G.constraint7 = false;
+        G.freePlayAfterJoker = false;
+        G.freePlayAfter2 = false;
+        G.bannerText = `${player.name} recolheu o monte (${count} cartas)!`;
+
+        const fx = { kind: 'PICKUP', actorId: player.id, count, sfxTag: 'PICKUP' };
+        triggerFlightVisual({ ...fx, isMe: player.id === myPlayerId });
+        maybeBotReact(player, 'PICKUP', count);
+        advanceTurn(false, fx);
+        return;
+      }
+
+      if (action.type === 'PLAY_BLIND') {
+        if (player.hand.length > 0 || player.open.length > 0) return;
+        const cIdx = player.closed.findIndex(c => c.id === action.cardId);
+        if (cIdx === -1) return;
+        const chosen = player.closed.splice(cIdx, 1)[0];
+
+        if (RulesEngine.isCardPlayable(G, chosen)) {
+          processPlayedCards(player, [chosen], action.fromRect, 'BLIND_SUCCESS');
+        } else {
+          const topBefore = G.discard.length > 0
+            ? G.discard[G.discard.length - 1].label + G.discard[G.discard.length - 1].suit
+            : 'Vazio';
+          G.discard.push(chosen);
+          const count = G.discard.length;
+
+          LoggerModule.logTurn({
+            player: player.name,
+            persona: player.persona || 'human',
+            action: 'BLIND_FAIL_PICKUP',
+            cardFlipped: chosen.label + chosen.suit,
+            discardTopBefore: topBefore,
+            discardCountCollected: count
+          });
+
+          G.discard.forEach(c => { c.public = true; });
+          player.hand.push(...G.discard);
+          G.discard = [];
+          G.discardPlayGroups = [];
+          G.constraint7 = false;
+          G.freePlayAfterJoker = false;
+          G.freePlayAfter2 = false;
+          G.bannerText = `${player.name} revelou ${chosen.label}${chosen.suit} inválido e recolheu tudo!`;
+          if (player.id === myPlayerId) {
+            showInvalidWarning(`Carta fechada (${chosen.label}${chosen.suit}) menor que o monte! Você recolheu tudo.`);
+          }
+          const fx = { kind: 'PICKUP', actorId: player.id, count, sfxTag: 'PICKUP' };
+          triggerFlightVisual({ ...fx, isMe: player.id === myPlayerId });
+          maybeBotReact(player, 'PICKUP', count);
+          advanceTurn(false, fx);
+        }
+        return;
+      }
+
+      if (action.type === 'PLAY_CARDS') {
+        const handChosen = player.hand.filter(c => action.handIds.includes(c.id));
+        const openChosen = player.open.filter(c => action.openIds.includes(c.id));
+        const allChosen = [...handChosen, ...openChosen];
+
+        if (allChosen.length === 0) return;
+        const firstVal = allChosen[0].val;
+        if (!allChosen.every(c => c.val === firstVal)) return;
+        if (!RulesEngine.isCardPlayable(G, allChosen[0])) return;
+
+        if (handChosen.length > 0 && openChosen.length > 0) {
+          if (G.deck.length > 0 || handChosen.length !== player.hand.length) return;
+        }
+        if (handChosen.length === 0 && player.hand.length > 0) return;
+
+        const handSnapshot = player.hand.map(c => c.label + c.suit);
+        const openSnapshot = player.open.map(c => c.label + c.suit);
+
+        player.hand = player.hand.filter(c => !action.handIds.includes(c.id));
+        player.open = player.open.filter(c => !action.openIds.includes(c.id));
+
+        processPlayedCards(player, allChosen, action.fromRect, 'PLAY_CARDS', handSnapshot, openSnapshot);
+      }
+    }
+
+    function processPlayedCards(player, cardsPlayed, fromRect = null, sourceAction = 'PLAY', handBefore = [], openBefore = []) {
+      const r = G.rules;
+      const sample = cardsPlayed[0];
+      const countPlayed = cardsPlayed.length;
+      const topBefore = G.discard.length > 0
+        ? G.discard[G.discard.length - 1].label + G.discard[G.discard.length - 1].suit
+        : 'Vazio';
+
+      LoggerModule.logTurn({
+        player: player.name,
+        persona: player.persona || 'human',
+        action: sourceAction,
+        cardsPlayed: cardsPlayed.map(c => c.label + c.suit),
+        handBefore,
+        openBefore,
+        discardTopBefore: topBefore,
+        discardCountBefore: G.discard.length,
+        constraint7Before: G.constraint7,
+        freeAfter2Before: G.freePlayAfter2,
+        deckCount: G.deck.length,
+        turnsWithoutProgress: G.stall ? G.stall.sinceProgress : 0,
+        at: new Date().toISOString()
+      });
+
+      G.discard.push(...cardsPlayed);
+      G.discardPlayGroups.push({
+        playerName: player.name,
+        cards: cardsPlayed.map(c => ({ ...c }))
+      });
+
+      G.constraint7 = false;
+      G.freePlayAfterJoker = false;
+      G.freePlayAfter2 = false;
+
+      let playAgain = false;
+      let burned = false;
+      let reversed = false;
+      let sfxTag = 'PLAY';
+
+      const targetSame = r.decks === 1 ? 4 : 8;
+      if (r.p48 && !sample.isJoker) {
+        if (r.mode48 === 'together') {
+          if (countPlayed >= targetSame) reversed = true;
+        } else {
+          let seqCount = 0;
+          for (let i = G.discard.length - 1; i >= 0; i--) {
+            if (G.discard[i].val === sample.val && !G.discard[i].isJoker) seqCount++;
+            else break;
+          }
+          if (seqCount >= targetSame) reversed = true;
+        }
+      }
+
+      if (reversed) {
+        G.direction *= -1;
+        sfxTag = 'REVERSE';
+        if (r.burn48) burned = true;
+      }
+
+      if (sample.val === 10 && r.p10) {
+        burned = true;
+        sfxTag = 'BURN10';
+        if (r.after10 === 'again') playAgain = true;
+      }
+
+      if (sample.val === 7 && r.p7 && !burned) {
+        G.constraint7 = true;
+        sfxTag = 'POWER7';
+      }
+
+      if (sample.val === 15 && r.p2) {
+        playAgain = true;
+        G.freePlayAfter2 = true;
+        sfxTag = 'POWER2';
+        if (player.hand.length === 0 && G.deck.length > 0) {
+          const drawCount = Math.min(r.draw2, G.deck.length);
+          player.hand.push(...G.deck.splice(0, drawCount));
+          triggerFlightVisual({ kind: 'DRAW', actorId: player.id, isMe: player.id === myPlayerId, count: drawCount });
+        }
+      }
+
+      if (sample.isJoker && r.pjoker) {
+        G.freePlayAfterJoker = true;
+        sfxTag = 'JOKER';
+        const steps = r.multijoker === 'per_joker' ? countPlayed : 1;
+        rotateHandsInPlayDirection(steps);
+      }
+
+      if (burned) {
+        G.burnedCount = (G.burnedCount || 0) + G.discard.length;
+        G.discard = [];
+        G.discardPlayGroups = [];
+        G.constraint7 = false;
+        G.freePlayAfterJoker = false;
+        G.freePlayAfter2 = false;
+        sfxTag = 'BURN10';
+      }
+
+      if (!playAgain && G.deck.length > 0 && player.hand.length < 3) {
+        const needed = Math.min(3 - player.hand.length, G.deck.length);
+        player.hand.push(...G.deck.splice(0, needed));
+        triggerFlightVisual({ kind: 'DRAW', actorId: player.id, isMe: player.id === myPlayerId, count: needed });
+      }
+
+      G.players.forEach(p => {
+        if (!p.escaped && p.hand.length === 0 && p.open.length === 0 && p.closed.length === 0 && G.deck.length === 0) {
+          p.escaped = true;
+        }
+      });
+
+      const desc = `${player.name} jogou ${countPlayed}x ${sample.label}${sample.isJoker ? '' : sample.suit}`;
+      if (sample.val === 15 && r.p2 && !player.escaped) {
+        G.bannerText = `${desc} — ${player.name} continua jogando (qualquer carta)!`;
+      } else if (burned) {
+        G.bannerText = `${desc} (Monte Queimado!)`;
+      } else if (reversed) {
+        G.bannerText = `${desc} (Ordem Invertida!)`;
+      } else {
+        G.bannerText = desc;
+      }
+
+      const activeRemaining = G.players.filter(p => !p.escaped);
+      if (activeRemaining.length <= 1) {
+        const loser = activeRemaining[0] || player;
+        G.phase = 'GAMEOVER';
+        G.loserName = loser.name;
+        G.loserAvatar = loser.avatar || AvatarModule.getDefaultAvatar(loser.type, loser.persona);
+        G.loserId = loser.id;
+        turboMode = false;
+        if (G.mode === 'normal') addLossScore(loser.name); // simulação e tutorial não contam
+        G.scores = getScores();
+        LoggerModule.logMatchEnd(loser.name);
+        const overFx = { kind: 'PLAY', actorId: player.id, cards: cardsPlayed, sfxTag: 'GAMEOVER' };
+        triggerFlightVisual({ ...overFx, isMe: player.id === myPlayerId, fromRect });
+        broadcastState(overFx);
+        renderGame();
+        return;
+      }
+
+      const fx = { kind: 'PLAY', actorId: player.id, cards: cardsPlayed, sfxTag, burned };
+      triggerFlightVisual({ ...fx, isMe: player.id === myPlayerId, fromRect });
+      maybeBotReact(player, burned ? 'BURN' : (reversed ? 'REVERSE' : (sample.isJoker ? 'JOKER' : null)));
+
+      if (player.escaped) playAgain = false;
+      advanceTurn(playAgain, fx);
+    }
+
+    function rotateHandsInPlayDirection(steps) {
+      const activePlayers = G.players.filter(p => !p.escaped);
+      if (activePlayers.length < 2) return;
+      const totalSteps = steps % activePlayers.length;
+      if (totalSteps === 0) return;
+
+      for (let s = 0; s < totalSteps; s++) {
+        const snapshot = activePlayers.map(p => [...p.hand]);
+        const n = activePlayers.length;
+        for (let i = 0; i < n; i++) {
+          const targetIdx = (i + G.direction + n) % n;
+          activePlayers[targetIdx].hand = snapshot[i];
+        }
+      }
+    }
+
+    function advanceTurn(samePlayerAgain, fx = null) {
+      selectedHandIds.clear();
+      selectedOpenIds.clear();
+
+      if (!samePlayerAgain) {
+        G.turnIdx = RulesEngine.getNextActivePlayerIndex(G, G.turnIdx);
+      }
+      updateStallTracker();
+
+      broadcastState(fx);
+      renderGame();
+      scheduleBotIfNeeded();
+    }
+
+    // Detector de estagnação: conta turnos sem que ninguém atinja seu menor nº de cartas
+    // e sem o baralho de compra diminuir. A IA usa isso para mudar de estratégia.
+    function updateStallTracker() {
+      if (!G.stall) G.stall = { best: {}, lastDeck: G.deck.length, sinceProgress: 0, maxStreak: 0 };
+      let progressed = G.deck.length < G.stall.lastDeck;
+      G.stall.lastDeck = G.deck.length;
+      G.players.forEach(p => {
+        if (p.escaped) return;
+        const total = p.hand.length + p.open.length + p.closed.length;
+        const best = G.stall.best[p.id];
+        if (best === undefined || total < best) {
+          G.stall.best[p.id] = total;
+          progressed = true;
+        }
+      });
+      G.stall.sinceProgress = progressed ? 0 : G.stall.sinceProgress + 1;
+      G.turnCounter = (G.turnCounter || 0) + 1;
+      G.stall.maxStreak = Math.max(G.stall.maxStreak, G.stall.sinceProgress);
+    }
+
+    const BOT_DELAY_MS = 950;
+    const TURBO_DELAY_MS = 45;
+
+    function scheduleBotIfNeeded() {
+      if (!isHost || !G || G.phase !== 'PLAY') return;
+      clearTimeout(aiTimeout);
+      if (coachOpen) return; // tutorial pausado enquanto o balão está aberto
+      const current = G.players[G.turnIdx];
+      if (!current || current.type !== 'bot') return;
+
+      aiTimeout = setTimeout(() => {
+        if (!G || G.phase !== 'PLAY' || coachOpen) return;
+        const decision = AIEngine.decideTurnAction(G, G.turnIdx);
+        if (decision) executePlayerAction(current.id, decision);
+      }, turboMode ? TURBO_DELAY_MS : BOT_DELAY_MS);
+    }
+
+    /* ==========================================================================
+       10. INTERAÇÃO DE PONTEIRO UNIFICADA (MOUSE + TOUCH)
+       - Toque: seleciona | toque duplo: joga | arrastar até a mesa: joga
+       - Segurar 2 s numa carta da mão: seleciona todas do mesmo valor
+       - Na mão, deslizar na horizontal rola as cartas (touch-action: pan-x)
+       ========================================================================== */
+    const LONG_PRESS_MS = 2000;
+    let lastTapInfo = { id: null, t: 0 };
+
+    function attachCardInteraction(domEl, card, sourceType, me, isMyTurn) {
+      let startX = 0;
+      let startY = 0;
+      let isDragging = false;
+      let ghostEl = null;
+      let longPressTimer = null;
+      let holdVisualTimer = null;
+      let longPressFired = false;
+
+      domEl.addEventListener('contextmenu', (e) => e.preventDefault());
+
+      domEl.addEventListener('pointerdown', (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        SoundEngine.init();
+        startX = e.clientX;
+        startY = e.clientY;
+        isDragging = false;
+        longPressFired = false;
+        try { domEl.setPointerCapture(e.pointerId); } catch (err) {}
+
+        // Segurar para selecionar todas as cartas iguais da mão
+        if (sourceType === 'hand' && G && G.phase === 'PLAY' && isMyTurn) {
+          domEl.style.setProperty('--lp-ms', `${LONG_PRESS_MS - 250}ms`);
+          holdVisualTimer = setTimeout(() => domEl.classList.add('long-pressing'), 250);
+          longPressTimer = setTimeout(() => {
+            longPressFired = true;
+            domEl.classList.remove('long-pressing');
+            selectAllSameValue(me, card);
+          }, LONG_PRESS_MS);
+        }
+
+        const cancelLongPress = () => {
+          clearTimeout(holdVisualTimer);
+          clearTimeout(longPressTimer);
+          holdVisualTimer = null;
+          longPressTimer = null;
+          domEl.classList.remove('long-pressing');
+        };
+
+        const cleanup = (ev) => {
+          cancelLongPress();
+          try { domEl.releasePointerCapture(ev.pointerId); } catch (err) {}
+          domEl.removeEventListener('pointermove', onPointerMove);
+          domEl.removeEventListener('pointerup', onPointerUp);
+          domEl.removeEventListener('pointercancel', onPointerCancel);
+          domEl.classList.remove('dragging-source');
+          clearDropHighlights();
+          if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+        };
+
+        const onPointerMove = (moveEv) => {
+          const dx = moveEv.clientX - startX;
+          const dy = moveEv.clientY - startY;
+          if (Math.hypot(dx, dy) > 8) cancelLongPress();
+
+          // Na mão, gesto horizontal é rolagem (o navegador assume e dispara pointercancel)
+          if (!isDragging && Math.hypot(dx, dy) > 8) {
+            if (sourceType === 'hand' && e.pointerType !== 'mouse' && Math.abs(dx) > Math.abs(dy)) return;
+            isDragging = true;
+            SoundEngine.select();
+            domEl.classList.add('dragging-source');
+            ghostEl = createCardDOM(card, sourceType === 'closed');
+            ghostEl.classList.add('drag-ghost');
+
+            let dragCount = 1;
+            if (G.phase === 'PLAY') {
+              const inSel = (sourceType === 'hand' && selectedHandIds.has(card.id)) ||
+                (sourceType === 'open' && selectedOpenIds.has(card.id));
+              if (inSel) dragCount = selectedHandIds.size + selectedOpenIds.size;
+            }
+            if (dragCount > 1) {
+              const badge = document.createElement('div');
+              badge.className = 'drag-count-badge';
+              badge.textContent = `x${dragCount}`;
+              ghostEl.appendChild(badge);
+            }
+            document.getElementById('fx-layer').appendChild(ghostEl);
+          }
+
+          if (isDragging && ghostEl) {
+            ghostEl.style.left = `${moveEv.clientX}px`;
+            ghostEl.style.top = `${moveEv.clientY}px`;
+            highlightDropTargets(moveEv.clientX, moveEv.clientY, sourceType);
+          }
+        };
+
+        // Cancelado pelo navegador (ex.: rolagem da mão): só limpa, nunca conta como toque
+        const onPointerCancel = (cancelEv) => cleanup(cancelEv);
+
+        const onPointerUp = (upEv) => {
+          const wasDragging = isDragging;
+          const dropRect = ghostEl ? ghostEl.getBoundingClientRect() : domEl.getBoundingClientRect();
+          cleanup(upEv);
+
+          if (longPressFired) return;
+          if (wasDragging) {
+            handleCardDrop(upEv.clientX, upEv.clientY, card, sourceType, me, isMyTurn, dropRect, domEl);
+            return;
+          }
+          // O 1º toque redesenha a mão (novo elemento), então o toque anterior fica guardado por carta
+          const now = Date.now();
+          const lastTapTime = lastTapInfo.id === card.id ? lastTapInfo.t : 0;
+          lastTapInfo = { id: card.id, t: now };
+          if (G.phase === 'PLAY' && now - lastTapTime < 380 && sourceType !== 'closed') {
+            lastTapInfo = { id: null, t: 0 };
+            const ids = sourceType === 'hand'
+              ? (selectedHandIds.has(card.id) ? [Array.from(selectedHandIds), Array.from(selectedOpenIds)] : [[card.id], []])
+              : (selectedOpenIds.has(card.id) ? [Array.from(selectedHandIds), Array.from(selectedOpenIds)] : [[], [card.id]]);
+            attemptLocalPlay(ids[0], ids[1], domEl.getBoundingClientRect());
+            return;
+          }
+          handleCardTap(card, sourceType, me, isMyTurn, domEl);
+        };
+
+        domEl.addEventListener('pointermove', onPointerMove);
+        domEl.addEventListener('pointerup', onPointerUp);
+        domEl.addEventListener('pointercancel', onPointerCancel);
+      });
+    }
+
+    function selectAllSameValue(me, card) {
+      if (!G || G.phase !== 'PLAY') return;
+      const same = me.hand.filter(c => !c.isJoker && !card.isJoker ? c.val === card.val : c.isJoker && card.isJoker);
+      selectedHandIds.clear();
+      selectedOpenIds.clear();
+      same.forEach(c => selectedHandIds.add(c.id));
+      if (navigator.vibrate) { try { navigator.vibrate(30); } catch (e) {} }
+      SoundEngine.select();
+      renderGame();
+    }
+
+    function highlightDropTargets(x, y, sourceType) {
+      clearDropHighlights();
+      if (!G) return;
+
+      if (G.phase === 'SWAP') {
+        if (sourceType === 'hand') {
+          document.querySelectorAll('.open-over').forEach(el => {
+            const r = el.getBoundingClientRect();
+            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+              el.classList.add('drop-target-glow');
+            }
+          });
+        } else if (sourceType === 'open') {
+          document.querySelectorAll('#my-hand-cards .playing-card').forEach(el => {
+            const r = el.getBoundingClientRect();
+            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+              el.classList.add('drop-target-glow');
+            }
+          });
+        }
+      } else if (G.phase === 'PLAY') {
+        const felt = document.getElementById('center-drop-zone');
+        const discard = document.getElementById('discard-pile-visual');
+        const r = felt.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+          felt.classList.add('drop-ready');
+          discard.classList.add('highlight-drop');
+        }
+      }
+    }
+
+    function clearDropHighlights() {
+      document.querySelectorAll('.drop-target-glow').forEach(el => el.classList.remove('drop-target-glow'));
+      document.getElementById('center-drop-zone')?.classList.remove('drop-ready');
+      document.getElementById('discard-pile-visual')?.classList.remove('highlight-drop');
+    }
+
+    function handleCardDrop(x, y, card, sourceType, me, isMyTurn, dropRect, domEl) {
+      if (!G) return;
+
+      if (G.phase === 'SWAP' && !me.readySwap) {
+        if (sourceType === 'hand') {
+          for (const el of document.querySelectorAll('.open-over')) {
+            const r = el.getBoundingClientRect();
+            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && el.dataset.cardId) {
+              sendOrExecuteAction({ type: 'SWAP_CARDS', handId: card.id, openId: el.dataset.cardId });
+              swapHandId = null;
+              return;
+            }
+          }
+        } else if (sourceType === 'open') {
+          for (const el of document.querySelectorAll('#my-hand-cards .playing-card')) {
+            const r = el.getBoundingClientRect();
+            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && el.dataset.cardId) {
+              sendOrExecuteAction({ type: 'SWAP_CARDS', handId: el.dataset.cardId, openId: card.id });
+              swapHandId = null;
+              return;
+            }
+          }
+        }
+        return;
+      }
+
+      if (G.phase === 'PLAY') {
+        const felt = document.getElementById('center-drop-zone').getBoundingClientRect();
+        if (x >= felt.left && x <= felt.right && y >= felt.top && y <= felt.bottom) {
+          if (!isMyTurn) {
+            showInvalidWarning('Aguarde a sua vez de jogar!', domEl);
+            return;
+          }
+          if (sourceType === 'closed') {
+            if (me.hand.length > 0 || me.open.length > 0) {
+              showInvalidWarning('Jogue todas as cartas da mão e as abertas antes de virar as fechadas!', domEl);
+              return;
+            }
+            sendOrExecuteAction({ type: 'PLAY_BLIND', cardId: card.id, fromRect: dropRect });
+            return;
+          }
+
+          let hIds = [];
+          let oIds = [];
+          if (sourceType === 'hand') {
+            if (selectedHandIds.has(card.id)) {
+              hIds = Array.from(selectedHandIds);
+              oIds = Array.from(selectedOpenIds);
+            } else {
+              hIds = [card.id];
+            }
+          } else if (sourceType === 'open') {
+            if (selectedOpenIds.has(card.id)) {
+              hIds = Array.from(selectedHandIds);
+              oIds = Array.from(selectedOpenIds);
+            } else {
+              oIds = [card.id];
+            }
+          }
+
+          const ok = attemptLocalPlay(hIds, oIds, dropRect);
+          if (!ok) {
+            domEl.classList.add('shake-error');
+            setTimeout(() => domEl.classList.remove('shake-error'), 400);
+          }
+        }
+      }
+    }
+
+    function handleCardTap(card, sourceType, me, isMyTurn, domEl) {
+      if (!G) return;
+
+      if (G.phase === 'SWAP' && !me.readySwap) {
+        if (sourceType === 'hand') {
+          SoundEngine.select();
+          swapHandId = swapHandId === card.id ? null : card.id;
+          renderGame();
+        } else if (sourceType === 'open') {
+          if (swapHandId) {
+            sendOrExecuteAction({ type: 'SWAP_CARDS', handId: swapHandId, openId: card.id });
+            swapHandId = null;
+          } else {
+            showInvalidWarning('Toque primeiro em uma carta da mão (ou arraste-a) para trocar com a mesa!');
+          }
+        }
+        return;
+      }
+
+      if (G.phase === 'PLAY') {
+        if (!isMyTurn) {
+          showInvalidWarning('Aguarde a sua vez de jogar!', domEl);
+          return;
+        }
+        if (sourceType === 'closed') {
+          if (me.hand.length > 0 || me.open.length > 0) {
+            showInvalidWarning('Você só pode virar as cartas fechadas quando acabar com a mão e as abertas!', domEl);
+            return;
+          }
+          sendOrExecuteAction({ type: 'PLAY_BLIND', cardId: card.id, fromRect: domEl.getBoundingClientRect() });
+          return;
+        }
+        if (sourceType === 'hand') {
+          toggleSelectHandCard(me, card);
+        } else if (sourceType === 'open') {
+          toggleSelectOpenCard(me, card, domEl);
+        }
+      }
+    }
+
+    /* ==========================================================================
+       11. RENDERIZAÇÃO: MESA REDONDA, PILHAS 3D, PLACAR E FIM DE JOGO
+       ========================================================================== */
+    function scoreFor(name) {
+      const sc = (G && G.scores) || getScores();
+      const v = sc[name] || 0;
+      return v < 0 ? `💀 ${v}` : '';
+    }
+
+    function renderTurnSequenceBar(meIdx) {
+      const seqBar = document.getElementById('turn-sequence-bar');
+      seqBar.innerHTML = '';
+      if (!G) return;
+
+      const nextIdx = G.phase === 'PLAY' ? RulesEngine.getNextActivePlayerIndex(G, G.turnIdx) : -1;
+      const n = G.players.length;
+      // Mostra na ordem real de jogada, começando por quem está jogando
+      const startIdx = G.phase === 'PLAY' ? G.turnIdx : 0;
+      const order = [];
+      for (let k = 0; k < n; k++) order.push(((startIdx + k * G.direction) % n + n) % n);
+
+      order.forEach((idx, k) => {
+        const p = G.players[idx];
+        const node = document.createElement('div');
+        const isCurrent = G.phase === 'PLAY' && idx === G.turnIdx;
+        const isNext = G.phase === 'PLAY' && idx === nextIdx && idx !== G.turnIdx;
+        node.className = 'seq-node' + (isCurrent ? ' seq-active' : '') + (isNext ? ' seq-next' : '') + (p.escaped ? ' seq-escaped' : '');
+        const avatarSrc = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
+        const tag = isCurrent ? ' · VEZ' : (isNext ? ' · PRÓX' : '');
+        node.innerHTML = `<img src="${avatarSrc}" alt="" /><span>${idx === meIdx && G.mode !== 'sim' ? 'Você' : p.name.split(' ')[0]}${tag}</span>`;
+        seqBar.appendChild(node);
+        if (k < n - 1) {
+          const arrow = document.createElement('span');
+          arrow.className = 'seq-arrow';
+          arrow.textContent = '›';
+          seqBar.appendChild(arrow);
+        }
+      });
+    }
+
+    // Posições dos adversários num arco elíptico (o jogador local fica na base)
+    function seatPositions(count) {
+      const out = [];
+      for (let i = 0; i < count; i++) {
+        const theta = Math.PI + (i + 1) * (Math.PI / (count + 1)); // de 180° (esquerda) a 360° (direita) pelo topo
+        out.push({
+          left: 50 + 41 * Math.cos(theta),
+          top: 1 + 36 * (1 + Math.sin(theta)) // âncora no topo do assento
+        });
+      }
+      return out;
+    }
+
+    function renderSeats(myIdx, nextIdx) {
+      const oppArea = document.getElementById('opponents-area');
+      oppArea.innerHTML = '';
+      const total = G.players.length;
+      const positions = seatPositions(total - 1);
+      for (let offset = 1; offset < total; offset++) {
+        // Sentido horário na tela: a partir de você (base) → esquerda → topo → direita
+        const idx = (myIdx + offset) % total;
+        const p = G.players[idx];
+        const pos = positions[offset - 1];
+        const isTurn = G.turnIdx === idx && G.phase === 'PLAY';
+        const isNext = nextIdx === idx && G.phase === 'PLAY' && idx !== G.turnIdx;
+
+        const seat = document.createElement('div');
+        seat.className = 'seat' + (isTurn ? ' turn-active' : '') + (isNext ? ' next-active' : '') + (p.escaped ? ' safe-out' : '');
+        seat.dataset.seatId = p.id;
+        seat.style.left = `${pos.left}%`;
+        seat.style.top = `${pos.top}%`;
+
+        const miniTable = [0, 1, 2].map(i => {
+          const o = p.open[i];
+          const c = p.closed[i];
+          if (o) return `<div class="mini-slot open-card ${o.isRed ? 'red' : ''}">${o.isJoker ? '★' : o.label}</div>`;
+          if (c) return `<div class="mini-slot"></div>`;
+          return `<div class="mini-slot empty"></div>`;
+        }).join('');
+
+        const status = p.escaped ? '✔ Salvo!' : (isTurn ? 'jogando…' : (isNext ? 'próximo' : ''));
+        const avatarSrc = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
+        seat.innerHTML = `
+          <div class="seat-avatar-wrap">
+            <img class="seat-avatar" src="${avatarSrc}" alt="" />
+            <span class="skull-badge">${scoreFor(p.name)}</span>
+            <span class="seat-hand-pill" title="Cartas na mão">${p.hand.length}</span>
+          </div>
+          <div class="seat-name">${p.name}</div>
+          <div class="opp-mini-table">${miniTable}</div>
+          <div class="seat-status">${status}</div>`;
+        oppArea.appendChild(seat);
+      }
+    }
+
+    function renderDrawPile() {
+      const stack = document.getElementById('draw-pile-visual');
+      const top = stack.querySelector('.deck-top');
+      const n = G.deck.length;
+      document.getElementById('lbl-deck-count').textContent = n;
+      document.getElementById('lbl-deck-badge').textContent = n;
+      stack.classList.toggle('empty', n === 0);
+      // Espessura 3D: uma "lâmina" de borda para cada ~4 cartas (máx. 10)
+      const layers = Math.min(10, Math.ceil(n / 4));
+      const shadows = [];
+      for (let i = 1; i <= layers; i++) {
+        shadows.push(`${i * 0.6}px ${i * 1.1}px 0 ${i % 2 ? '#e2e8f0' : '#94a3b8'}`);
+      }
+      shadows.push(`${layers * 0.6 + 2}px ${layers * 1.1 + 4}px 8px rgba(0,0,0,0.55)`);
+      top.style.boxShadow = shadows.join(', ');
+      top.style.transform = `translate(${-layers * 0.6}px, ${-layers * 1.1}px)`;
+    }
+
+    function renderBurnedPile() {
+      const el = document.getElementById('burned-pile-visual');
+      const n = G.burnedCount || 0;
+      document.getElementById('lbl-burned-badge').textContent = n;
+      const layers = Math.min(6, Math.ceil(n / 4));
+      if (el.childElementCount === layers) return; // evita recriar sem necessidade
+      el.innerHTML = '';
+      for (let i = 0; i < layers; i++) {
+        const c = createCardDOM(null, true);
+        const j = cardJitter({ id: 'burn' + i });
+        c.style.transform = `translate(${(j * 6 - 3).toFixed(1)}px, ${-i * 1.5}px) rotate(${(j * 30 - 15).toFixed(1)}deg)`;
+        el.appendChild(c);
+      }
+    }
+
+    function renderDiscardPileMessy() {
+      const discardEl = document.getElementById('discard-pile-visual');
+      discardEl.innerHTML = '';
+      const totalCards = G.discard.length;
+      document.getElementById('lbl-discard-badge').textContent = `Monte ${totalCards}`;
+      if (totalCards === 0) return;
+
+      const groups = G.discardPlayGroups && G.discardPlayGroups.length > 0
+        ? G.discardPlayGroups
+        : [{ playerName: '', cards: G.discard.slice(-2) }];
+      const lastGroup = groups[groups.length - 1];
+      const penultimateGroup = groups.length >= 2 ? groups[groups.length - 2] : null;
+      const visibleCount = lastGroup.cards.length + (penultimateGroup ? penultimateGroup.cards.length : 0);
+      const olderCards = G.discard.slice(0, Math.max(0, totalCards - visibleCount));
+
+      // Base volumosa: as cartas soterradas formam um bolo bagunçado (estável entre renders)
+      const step = Math.max(1, Math.ceil(olderCards.length / 9));
+      let layer = 0;
+      for (let i = 0; i < olderCards.length; i += step) {
+        const c = olderCards[i];
+        const dom = createCardDOM(c, false);
+        dom.classList.add('pile-body');
+        const jx = cardJitter(c, 'x') * 16 - 8;
+        const jr = cardJitter(c, 'r') * 50 - 25;
+        dom.style.transform = `translate(${jx.toFixed(1)}px, ${(4 - layer * 0.8).toFixed(1)}px) rotate(${jr.toFixed(1)}deg) scale(0.96)`;
+        discardEl.appendChild(dom);
+        layer++;
+      }
+
+      // Penúltima jogada (à esquerda, levemente escurecida)
+      if (penultimateGroup) {
+        penultimateGroup.cards.forEach((c, idx) => {
+          const dom = createCardDOM(c, false);
+          const angle = -16 + idx * 7 + cardJitter(c, 'p') * 6;
+          dom.style.transform = `translate(${-20 + idx * 9}px, ${-6 + idx * 2}px) rotate(${angle.toFixed(1)}deg) scale(0.95)`;
+          dom.style.filter = 'brightness(0.82)';
+          if (idx === penultimateGroup.cards.length - 1) {
+            const tag = document.createElement('div');
+            tag.className = 'discard-play-tag';
+            tag.textContent = `${penultimateGroup.playerName.split(' ')[0]} ${penultimateGroup.cards.length}x`;
+            dom.appendChild(tag);
+          }
+          discardEl.appendChild(dom);
+        });
+      }
+
+      // Última jogada (topo, espalhada e nítida)
+      lastGroup.cards.forEach((c, idx) => {
+        const dom = createCardDOM(c, false);
+        const baseX = penultimateGroup ? 14 : 0;
+        const baseY = penultimateGroup ? 5 : 0;
+        const angle = (cardJitter(c, 'l') * 26 - 13);
+        dom.style.transform = `translate(${baseX + idx * 11}px, ${baseY + (idx % 2 ? -3 : 2)}px) rotate(${angle.toFixed(1)}deg)`;
+        dom.style.boxShadow = '0 6px 14px rgba(0,0,0,0.55)';
+        if (idx === lastGroup.cards.length - 1) {
+          const tag = document.createElement('div');
+          tag.className = 'discard-play-tag tag-latest';
+          tag.textContent = `${(lastGroup.playerName || 'Topo').split(' ')[0]} ${lastGroup.cards.length}x`;
+          dom.appendChild(tag);
+        }
+        discardEl.appendChild(dom);
+      });
+    }
+
+    function renderGame() {
+      if (!G) return;
+      sanitizeUIState();
+
+      // Espectador: simulação local, ou convidado que entrou com a partida já em andamento
+      const outsider = !G.players.some(p => p.id === myPlayerId);
+      const spectator = G.mode === 'sim' || outsider;
+      const hideHand = outsider && G.mode !== 'sim'; // não mostra a mão de outra pessoa
+      const me = G.players.find(p => p.id === myPlayerId) || G.players[0];
+      const myIdx = G.players.indexOf(me);
+      const isMyTurn = !spectator && G.turnIdx === myIdx && G.phase === 'PLAY';
+      const nextIdx = G.phase === 'PLAY' ? RulesEngine.getNextActivePlayerIndex(G, G.turnIdx) : -1;
+
+      document.getElementById('lbl-direction').textContent = G.direction === 1 ? '↻ Horário' : '↺ Anti-horário';
+
+      let constraintTxt = 'Monte livre';
+      let hot = false;
+      if (G.constraint7 && G.rules.p7) { constraintTxt = '7 no topo: jogue ≤ 7'; hot = true; }
+      else if (G.freePlayAfter2) { constraintTxt = '2: jogue qualquer carta'; }
+      else if (RulesEngine.hasJokerInDiscard(G)) { constraintTxt = '🃏 Coringa no monte'; hot = true; }
+      else if (G.discard.length > 0) {
+        const top = G.discard[G.discard.length - 1];
+        constraintTxt = top.val === 15 && G.rules.p2 ? '2: jogue qualquer carta' : `Topo: ${top.label}${top.isJoker ? '' : top.suit} — jogue igual ou maior`;
+      }
+      const chip = document.getElementById('lbl-Constraint');
+      chip.textContent = constraintTxt;
+      chip.classList.toggle('rule-hot', hot);
+      document.getElementById('status-banner').textContent = G.bannerText;
+
+      renderTurnSequenceBar(myIdx);
+      renderSeats(myIdx, nextIdx);
+      renderDrawPile();
+      renderBurnedPile();
+      renderDiscardPileMessy();
+
+      // Botão ⏩: aparece quando você já escapou (ou na simulação)
+      const turboBtn = document.getElementById('btn-turbo');
+      const canTurbo = isHost && G.phase === 'PLAY' && (spectator || me.escaped) && !turboMode;
+      turboBtn.style.display = canTurbo ? 'inline-block' : 'none';
+
+      // Zona do jogador local
+      const zone = document.getElementById('player-zone');
+      zone.classList.toggle('my-turn', isMyTurn);
+      document.getElementById('img-game-my-avatar').src = me.avatar || AvatarModule.getDefaultAvatar('human', null);
+      document.getElementById('lbl-my-name-game').textContent = hideHand
+        ? '👁 Você está assistindo — entra na próxima rodada'
+        : (spectator ? `👁 Assistindo: ${me.name}` : me.name);
+      document.getElementById('lbl-my-score').textContent = spectator ? '' : scoreFor(me.name);
+      document.getElementById('lbl-my-hand-count').textContent =
+        me.escaped ? '✔ Você escapou!' : (isMyTurn ? `⚡ Sua vez · ${me.hand.length} na mão` : `🃏 ${me.hand.length} na mão`);
+
+      // Cartas da mesa (fechadas + abertas por cima)
+      const myTableEl = document.getElementById('my-table-cards');
+      myTableEl.innerHTML = '';
+      for (let i = 0; i < 3; i++) {
+        const stack = document.createElement('div');
+        stack.className = 'table-stack';
+        const closedCard = me.closed[i];
+        const openCard = me.open[i];
+        if (!closedCard && !openCard) stack.classList.add('empty-slot');
+        if (closedCard) {
+          const cDom = createCardDOM(closedCard, true);
+          cDom.classList.add('closed-under');
+          cDom.dataset.cardId = closedCard.id;
+          if (!spectator) attachCardInteraction(cDom, closedCard, 'closed', me, isMyTurn);
+          stack.appendChild(cDom);
+        }
+        if (openCard) {
+          const oDom = createCardDOM(openCard, false);
+          oDom.classList.add('open-over');
+          oDom.dataset.cardId = openCard.id;
+          if (selectedOpenIds.has(openCard.id)) oDom.classList.add('selected');
+          if (isMyTurn && me.hand.length === 0 && RulesEngine.isCardPlayable(G, openCard)) oDom.classList.add('playable');
+          if (!spectator) attachCardInteraction(oDom, openCard, 'open', me, isMyTurn);
+          stack.appendChild(oDom);
+        }
+        myTableEl.appendChild(stack);
+      }
+
+      // Mão (preserva a posição de rolagem entre renders)
+      const myHandEl = document.getElementById('my-hand-cards');
+      const prevScroll = myHandEl.scrollLeft;
+      myHandEl.innerHTML = '';
+      const sortedHand = [...me.hand].sort((a, b) => a.val - b.val);
+      myHandEl.appendChild(Object.assign(document.createElement('div'), { className: 'hand-spacer' }));
+      sortedHand.forEach(card => {
+        const hDom = createCardDOM(card, hideHand);
+        hDom.dataset.cardId = card.id;
+        if (G.phase === 'SWAP' && swapHandId === card.id) hDom.classList.add('selected');
+        if (G.phase === 'PLAY' && selectedHandIds.has(card.id)) hDom.classList.add('selected');
+        if (isMyTurn && RulesEngine.isCardPlayable(G, card)) hDom.classList.add('playable');
+        if (!spectator) attachCardInteraction(hDom, card, 'hand', me, isMyTurn);
+        myHandEl.appendChild(hDom);
+      });
+      myHandEl.appendChild(Object.assign(document.createElement('div'), { className: 'hand-spacer' }));
+      myHandEl.scrollLeft = prevScroll;
+
+      // Botões de ação
+      const btnReady = document.getElementById('btn-ready-swap');
+      const btnPlay = document.getElementById('btn-play-selected');
+      const btnPickup = document.getElementById('btn-pickup-pile');
+      const actionBar = btnReady.parentElement;
+      actionBar.style.display = spectator ? 'none' : 'flex';
+      document.getElementById('reaction-bar').style.display = (spectator || G.mode === 'tutorial') ? 'none' : 'flex';
+
+      if (G.phase === 'SWAP') {
+        btnReady.style.display = 'block';
+        btnReady.disabled = me.readySwap;
+        btnReady.textContent = me.readySwap ? 'Aguardando outros...' : 'Pronto! Iniciar Jogo';
+        btnPlay.style.display = 'none';
+        btnPickup.style.display = 'none';
+      } else {
+        btnReady.style.display = 'none';
+        btnPlay.style.display = me.escaped ? 'none' : 'block';
+        btnPickup.style.display = me.escaped ? 'none' : 'block';
+
+        const totalSel = selectedHandIds.size + selectedOpenIds.size;
+        btnPlay.disabled = !isMyTurn;
+        btnPlay.textContent = totalSel > 0 ? `Jogar (${totalSel})` : 'Jogar Carta';
+
+        const pickupStatus = RulesEngine.canPlayerPickupPile(G, me);
+        btnPickup.disabled = !isMyTurn || G.discard.length === 0;
+        if (isMyTurn && !RulesEngine.hasAnyPlayableMove(G, me) && G.discard.length > 0) {
+          btnPickup.textContent = 'Recolher Monte (sem jogada)';
+          btnPickup.classList.add('pulse-btn');
+        } else {
+          btnPickup.textContent = (pickupStatus.allowed || G.discard.length === 0) ? 'Pegar Monte' : '🔒 Monte bloqueado';
+          btnPickup.classList.remove('pulse-btn');
+        }
+      }
+
+      // Modal de empate de velocidade
+      const speedModal = document.getElementById('modal-speed');
+      if (G.phase === 'SPEED_TIE' && G.tieContext) {
+        const amInTie = !spectator && G.tieContext.candidates.includes(myIdx);
+        speedModal.classList.add('active');
+        document.getElementById('speed-title').textContent =
+          G.tieContext.role === 'FIRST'
+            ? `Empate na carta mais baixa (${G.tieContext.label})!`
+            : `Empate para o 2º a jogar (${G.tieContext.label})!`;
+        document.getElementById('speed-desc').textContent = amInTie
+          ? 'Você está no empate! Toque primeiro para assumir!'
+          : 'Aguardando os jogadores empatados reagirem...';
+        document.getElementById('btn-speed-tap').style.display = amInTie ? 'block' : 'none';
+      } else {
+        speedModal.classList.remove('active');
+      }
+
+      // Tela de derrota com destaque para o perdedor
+      const overModal = document.getElementById('modal-gameover');
+      if (G.phase === 'GAMEOVER') {
+        const wasActive = overModal.classList.contains('active');
+        overModal.classList.add('active');
+        document.getElementById('gameover-avatar').src = G.loserAvatar || AvatarModule.getDefaultAvatar('human', null);
+        const loserIsMe = G.loserId === myPlayerId;
+        document.getElementById('gameover-name').textContent = loserIsMe ? `${G.loserName} (você!)` : G.loserName;
+        document.getElementById('gameover-text').textContent =
+          G.mode === 'normal'
+            ? 'Sobrou com cartas por último e leva -1 no placar.'
+            : (G.mode === 'tutorial' ? 'Tutorial concluído! Agora você já sabe jogar. 🎉' : 'Simulação encerrada (não conta no placar).');
+        const sc = G.scores || {};
+        const rows = G.players
+          .map(p => ({ name: p.name, pts: sc[p.name] || 0, avatar: p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona) }))
+          .sort((a, b) => a.pts - b.pts)
+          .map(r => `<div class="row"><span style="display:flex;align-items:center;gap:6px;"><img class="avatar-sm" style="width:22px;height:22px;" src="${r.avatar}" alt="" />${r.name}</span><strong style="color:${r.pts < 0 ? 'var(--danger)' : 'var(--text-dim)'};">💀 ${r.pts}</strong></div>`)
+          .join('');
+        document.getElementById('gameover-scores').innerHTML = rows;
+        document.getElementById('btn-rematch').style.display = isHost ? 'block' : 'none';
+        if (!wasActive && navigator.vibrate && loserIsMe) { try { navigator.vibrate([80, 60, 160]); } catch (e) {} }
+      } else {
+        overModal.classList.remove('active');
+      }
+
+      if (G.mode === 'tutorial') runTutorialCoach(me, isMyTurn);
+    }
+
+    function toggleSelectHandCard(me, card) {
+      SoundEngine.select();
+      if (selectedHandIds.has(card.id)) {
+        selectedHandIds.delete(card.id);
+        selectedOpenIds.clear();
+      } else {
+        const existing = me.hand.find(c => selectedHandIds.has(c.id));
+        if (existing && existing.val !== card.val) {
+          selectedHandIds.clear();
+          selectedOpenIds.clear();
+        }
+        selectedHandIds.add(card.id);
+      }
+      renderGame();
+    }
+
+    function toggleSelectOpenCard(me, card, domEl) {
+      if (me.hand.length > 0) {
+        if (G.deck.length > 0 || selectedHandIds.size !== me.hand.length) {
+          showInvalidWarning('Jogue todas as cartas da mão antes de selecionar as cartas da mesa!', domEl);
+          return;
+        }
+        const handSample = me.hand[0];
+        if (handSample.val !== card.val) {
+          showInvalidWarning('A carta da mesa só pode ser combinada com a última da mão se tiver o mesmo valor!', domEl);
+          return;
+        }
+      } else {
+        const existing = me.open.find(c => selectedOpenIds.has(c.id));
+        if (existing && existing.val !== card.val) {
+          selectedOpenIds.clear();
+        }
+      }
+
+      SoundEngine.select();
+      if (selectedOpenIds.has(card.id)) {
+        selectedOpenIds.delete(card.id);
+      } else {
+        selectedOpenIds.add(card.id);
+      }
+      renderGame();
+    }
+
+    /* ==========================================================================
+       TUTORIAL GUIADO: dicas que aparecem na hora certa durante a partida
+       ========================================================================== */
+    let lastTipTurn = -1;
+    function coachSay(key, text) {
+      if (tutorialSeen.has(key) || coachOpen) return false;
+      // Uma dica por turno (na preparação, todas em sequência)
+      const turnMark = G.phase === 'SWAP' ? -2 : (G.turnCounter || 0);
+      if (turnMark >= 0 && turnMark === lastTipTurn) return false;
+      lastTipTurn = turnMark;
+      tutorialSeen.add(key);
+      coachOpen = true;
+      clearTimeout(aiTimeout);
+      document.getElementById('coach-text').innerHTML = text;
+      document.getElementById('coach-bubble').classList.add('show');
+      return true;
+    }
+
+    function closeCoach() {
+      coachOpen = false;
+      document.getElementById('coach-bubble').classList.remove('show');
+      if (G) { renderGame(); scheduleBotIfNeeded(); }
+    }
+
+    function runTutorialCoach(me, isMyTurn) {
+      if (coachOpen || !G) return;
+      const top = G.discard[G.discard.length - 1];
+      const hasVal = (v) => me.hand.some(c => c.val === v);
+      const counts = {};
+      me.hand.forEach(c => { counts[c.val] = (counts[c.val] || 0) + 1; });
+
+      if (G.phase === 'SWAP') {
+        coachSay('welcome', '<b>Bem-vindo ao Shithead!</b> O objetivo é <b>não ser o último</b> com cartas. Você tem 3 cartas fechadas, 3 abertas na mesa e 3 na mão.') ||
+        coachSay('swap', 'Antes de começar, você pode <b>trocar</b> cartas da mão com as abertas. Dica: deixe cartas fortes (<b>2, 10, A</b>) na mesa para o final. Toque numa carta da mão e depois numa aberta. Quando terminar, toque em <b>Pronto</b>.');
+        return;
+      }
+      if (G.phase === 'GAMEOVER') return;
+      if (me.escaped) {
+        coachSay('escaped', 'Você <b>escapou</b>! 🎉 O jogo continua até sobrar só um: esse é o <b>Shithead</b>. Use o botão <b>⏩</b> no topo para acelerar até o fim.');
+        return;
+      }
+      if (G.players.some(p => p.escaped && p.id !== me.id)) {
+        if (coachSay('other-escaped', 'Um jogador zerou todas as cartas e está <b>salvo</b>. Quem sobrar por último perde e leva <b>-1</b> no placar 💀.')) return;
+      }
+      if (RulesEngine.hasJokerInDiscard(G)) {
+        if (coachSay('joker', 'Saiu um <b>Coringa</b> 🃏! Todos passaram a mão para o próximo jogador no sentido do jogo. Enquanto houver Coringa no monte, você só pode recolhê-lo se <b>não tiver jogada válida</b>.')) return;
+      }
+      if (G.burnedCount > 0) {
+        if (coachSay('burned', 'O monte foi <b>queimado</b> 🔥 e as cartas saíram do jogo (pilha "Fora", à direita).')) return;
+      }
+      if (!isMyTurn) return;
+
+      if (coachSay('first-turn', 'É a <b>sua vez</b>! Jogue uma carta <b>igual ou maior</b> que a do topo (as que podem ser jogadas brilham em verde). Toque para selecionar e depois em <b>Jogar</b>, ou toque duas vezes, ou arraste até a mesa.')) return;
+      if (G.constraint7 && G.rules.p7) {
+        if (coachSay('seven', 'Tem um <b>7</b> no topo: agora vale o contrário! Você precisa jogar uma carta <b>menor ou igual a 7</b> (ou um especial: 2, 10, Coringa).')) return;
+      }
+      if (hasVal(15) && coachSay('two', 'O <b>2</b> é a carta mais forte: pode ser jogado sobre qualquer carta e você <b>joga de novo</b> logo em seguida.')) return;
+      if (hasVal(10) && coachSay('ten', 'O <b>10</b> pode ser jogado a qualquer momento e <b>queima</b> o monte inteiro.')) return;
+      if (Object.values(counts).some(n => n >= 2) && coachSay('longpress', 'Você tem cartas repetidas! Jogue todas juntas: <b>segure uma delas por 2 segundos</b> para selecionar todas do mesmo valor.')) return;
+      if (G.discard.length > 0 && !RulesEngine.hasAnyPlayableMove(G, me)) {
+        if (coachSay('pickup', 'Sem jogada válida? Então você precisa <b>recolher o monte</b> (botão vermelho). Faz parte do jogo! 😅')) return;
+      }
+      if (G.deck.length === 0 && coachSay('deck-empty', 'O <b>baralho de compra acabou</b>. Quando sua mão zerar, jogue as cartas <b>abertas</b> da mesa e por último as <b>fechadas</b>, no escuro: se a carta virada não servir, você recolhe o monte.')) return;
+      if (top && top.val >= 11 && coachSay('high-top', `O topo está alto (${top.label}). Se não tiver carta maior, use um <b>2</b> ou <b>10</b>, ou recolha o monte.`)) return;
+    }
+
+    /* ==========================================================================
+       12. EVENTOS DE INTERFACE E UPLOAD DE FOTO
+       ========================================================================== */
+    document.getElementById('btn-mute-lobby').addEventListener('click', () => SoundEngine.toggleMute());
+    document.getElementById('btn-mute-game').addEventListener('click', () => SoundEngine.toggleMute());
+
+    document.getElementById('btn-camera-photo').addEventListener('click', () => {
+      document.getElementById('inp-file-camera').click();
+    });
+    document.getElementById('btn-gallery-photo').addEventListener('click', () => {
+      document.getElementById('inp-file-gallery').click();
+    });
+    document.getElementById('btn-reset-photo').addEventListener('click', () => {
+      myCustomAvatar = null;
+      Store.remove('sh_player_avatar');
+      syncMyAvatarPreview();
+    });
+
+    function handleAvatarInput(e) {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      AvatarModule.processImageFile(
+        file,
+        (dataUrl) => {
+          myCustomAvatar = dataUrl;
+          Store.set('sh_player_avatar', dataUrl);
+          syncMyAvatarPreview();
+        },
+        (errMsg) => showInvalidWarning(errMsg)
+      );
+      e.target.value = '';
+    }
+
+    const syncJokerSelect = () => {
+      document.getElementById('sel-jokers').disabled = !document.getElementById('chk-pjoker').checked;
+    };
+    document.getElementById('chk-pjoker').addEventListener('change', syncJokerSelect);
+    setTimeout(syncJokerSelect, 0);
+
+    // Aviso: sem nenhuma forma de queimar o monte, as cartas nunca saem do jogo
+    const syncBurnWarning = () => {
+      const p10 = document.getElementById('chk-p10').checked;
+      const burn48 = document.getElementById('chk-p48').checked && document.getElementById('chk-48burn').checked;
+      document.getElementById('warn-no-burn').style.display = (!p10 && !burn48) ? 'block' : 'none';
+    };
+    ['chk-p10', 'chk-p48', 'chk-48burn'].forEach(id => document.getElementById(id).addEventListener('change', syncBurnWarning));
+    setTimeout(syncBurnWarning, 0);
+
+    document.getElementById('inp-file-camera').addEventListener('change', handleAvatarInput);
+    document.getElementById('inp-file-gallery').addEventListener('change', handleAvatarInput);
+
+    document.getElementById('inp-name').addEventListener('input', (e) => {
+      const val = e.target.value.trim() || 'Jogador';
+      Store.set('sh_player_name', val);
+      if (isHost) {
+        lobbySlots[0].name = val;
+        renderLobbySlots();
+        clearTimeout(window.__nameTimer);
+        window.__nameTimer = setTimeout(broadcastLobby, 400);
+      } else {
+        clearTimeout(window.__nameTimer);
+        window.__nameTimer = setTimeout(sendProfileToHost, 400);
+      }
+    });
+
+    document.getElementById('btn-add-bot').addEventListener('click', () => {
+      if (lobbySlots.length >= 6) return;
+      SoundEngine.select();
+      const keys = ['easy', 'medium', 'hard'];
+      const pKey = keys[lobbySlots.length % 3];
+      lobbySlots.push({
+        id: 'bot_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
+        name: AppConfig.AI_PERSONAS[pKey].name,
+        type: 'bot',
+        persona: pKey,
+        avatar: AvatarModule.getDefaultAvatar('bot', pKey)
+      });
+      renderLobbySlots();
+    });
+
+    document.getElementById('btn-reset-scores').addEventListener('click', () => {
+      SoundEngine.select();
+      Store.remove('sh_scores');
+      renderScoreboard();
+    });
+
+    document.getElementById('btn-download-log').addEventListener('click', () => {
+      SoundEngine.select();
+      LoggerModule.downloadLastSession();
+    });
+
+    document.getElementById('btn-copy-log').addEventListener('click', () => {
+      const saved = LoggerModule.getSavedSession();
+      if (!saved) return;
+      navigator.clipboard.writeText(JSON.stringify(saved)).then(() => {
+        const btn = document.getElementById('btn-copy-log');
+        const old = btn.textContent;
+        btn.textContent = '✅ Log Copiado!';
+        setTimeout(() => { btn.textContent = old; }, 2000);
+      }).catch(() => {
+        LoggerModule.downloadLastSession();
+      });
+    });
+
+    document.getElementById('btn-start-match').addEventListener('click', () => {
+      if (!isHost) return;
+      const sim = document.getElementById('chk-sim-bots').checked;
+      if (sim && clientConns.length > 0) {
+        showInvalidWarning('Há jogadores conectados: desmarque "Simular só bots" para jogar com eles.');
+        return;
+      }
+      if (clientConns.length > 0) keepScreenAwake(true);
+      startNewMatch(false, sim ? 'sim' : 'normal');
+    });
+
+    document.getElementById('btn-tutorial').addEventListener('click', () => {
+      if (!isHost) return;
+      if (clientConns.length > 0) {
+        showInvalidWarning('O tutorial é só para você: feche a sala online antes.');
+        return;
+      }
+      tutorialSeen = new Set();
+      lastTipTurn = -1;
+      startNewMatch(false, 'tutorial');
+    });
+
+    document.getElementById('btn-rematch').addEventListener('click', () => {
+      if (!isHost) return;
+      // Depois do tutorial, a "Nova Rodada" já é uma partida normal
+      startNewMatch(true, currentMode === 'tutorial' ? 'normal' : currentMode);
+    });
+
+    document.getElementById('btn-coach-ok').addEventListener('click', closeCoach);
+
+    document.getElementById('btn-turbo').addEventListener('click', () => {
+      if (!G || G.phase !== 'PLAY') return;
+      turboMode = true;
+      G.bannerText = '⏩ Acelerando até o fim...';
+      renderGame();
+      scheduleBotIfNeeded();
+    });
+
+    document.querySelectorAll('.react-btn').forEach(btn => {
+      btn.addEventListener('click', () => sendReaction(btn.dataset.emoji));
+    });
+
+    // Mouse: a roda rola a mão na horizontal (desktop)
+    document.getElementById('my-hand-cards').addEventListener('wheel', (e) => {
+      const el = e.currentTarget;
+      if (el.scrollWidth <= el.clientWidth) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        el.scrollLeft += e.deltaY;
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    // Ao voltar para a aba/app, limpa resíduos visuais de gestos interrompidos
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && G) { sanitizeUIState(); renderGame(); }
+    });
+    window.addEventListener('blur', () => sanitizeUIState());
+
+    document.getElementById('btn-ready-swap').addEventListener('click', () => {
+      sendOrExecuteAction({ type: 'READY_SWAP' });
+    });
+
+    document.getElementById('btn-play-selected').addEventListener('click', () => {
+      attemptLocalPlay(Array.from(selectedHandIds), Array.from(selectedOpenIds));
+    });
+
+    document.getElementById('btn-pickup-pile').addEventListener('click', () => {
+      if (!G || G.phase !== 'PLAY') return;
+      const me = G.players.find(p => p.id === myPlayerId) || G.players[0];
+      const check = RulesEngine.canPlayerPickupPile(G, me);
+      if (!check.allowed) {
+        showInvalidWarning(check.reason);
+        return;
+      }
+      sendOrExecuteAction({ type: 'PICKUP_PILE' });
+    });
+
+    document.getElementById('btn-speed-tap').addEventListener('click', () => {
+      sendOrExecuteAction({ type: 'SPEED_TAP' });
+    });
+
+    function returnToLobbyScreen() {
+      clearTimeout(aiTimeout);
+      turboMode = false;
+      coachOpen = false;
+      document.getElementById('coach-bubble').classList.remove('show');
+      if (G && G.phase !== 'GAMEOVER') G.phase = 'ABANDONED'; // para os bots
+      document.getElementById('modal-gameover').classList.remove('active');
+      document.getElementById('screen-game').classList.remove('active');
+      document.getElementById('screen-lobby').classList.add('active');
+      refreshLogPanelUI();
+    }
+
+    document.getElementById('btn-leave').addEventListener('click', returnToLobbyScreen);
+    document.getElementById('btn-play-again').addEventListener('click', returnToLobbyScreen);
+
+    loadSavedSetup();

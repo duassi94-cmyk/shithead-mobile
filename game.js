@@ -404,7 +404,12 @@
               <img src="${avatarSrc}" class="avatar-sm" alt="${slot.name}" />
               <strong>${slot.name}${slot.id === myPlayerId ? ' <span style="color:var(--cyan);font-weight:600;">(você)</span>' : ''}</strong>
             </div>
-            <span class="badge">${idx === 0 ? 'Host' : 'Humano'}</span>
+            <div style="display:flex; gap:6px; align-items:center;">
+              ${idx === 0 ? '<span class="badge">Host</span>' : (isHost
+                ? `<span class="badge ${clientConns.some(c => c.__playerId === slot.id) ? 'badge-online' : 'badge-offline'}">${clientConns.some(c => c.__playerId === slot.id) ? 'online' : 'offline'}</span>
+                   <button data-kick="${idx}" class="btn btn-danger" style="padding:3px 7px; font-size:0.72rem;" title="Remover jogador">X</button>`
+                : '<span class="badge">Humano</span>')}
+            </div>
           `;
         } else {
           div.innerHTML = `
@@ -441,6 +446,7 @@
           lobbySlots[i].name = AppConfig.AI_PERSONAS[val].name;
           lobbySlots[i].avatar = AvatarModule.getDefaultAvatar('bot', val);
           renderLobbySlots();
+          broadcastLobby();
         });
       });
 
@@ -450,8 +456,56 @@
           const i = parseInt(e.target.dataset.remove, 10);
           lobbySlots.splice(i, 1);
           renderLobbySlots();
+          broadcastLobby();
         });
       });
+
+      // Host remove um jogador humano (ex.: duplicado ou que saiu)
+      container.querySelectorAll('[data-kick]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const i = parseInt(e.target.dataset.kick, 10);
+          const slot = lobbySlots[i];
+          if (!slot || i === 0) return;
+          kickPlayer(slot.id);
+        });
+      });
+    }
+
+    // Volta a ser o "dono" da própria mesa local (depois de sair/ser removido de uma sala)
+    function resetToLocalLobby() {
+      isHost = true;
+      myPlayerId = 'local_host';
+      const myName = document.getElementById('inp-name').value.trim() || 'Você';
+      lobbySlots = [
+        { id: 'local_host', name: myName, type: 'human', persona: null, avatar: myCustomAvatar || AvatarModule.getDefaultAvatar('human', null) },
+        ...['easy', 'medium', 'hard'].map((p, i) => ({ id: 'bot_' + (i + 1), name: AppConfig.AI_PERSONAS[p].name, type: 'bot', persona: p, avatar: AvatarModule.getDefaultAvatar('bot', p) }))
+      ];
+      G = null;
+      renderLobbySlots();
+    }
+
+    function kickPlayer(pid) {
+      clientConns.filter(c => c.__playerId === pid).forEach(c => {
+        c.__kicked = true;
+        try { c.send({ type: 'KICKED' }); } catch (e) {}
+        setTimeout(() => { try { c.close(); } catch (e) {} }, 300);
+      });
+      for (let i = clientConns.length - 1; i >= 0; i--) {
+        if (clientConns[i].__playerId === pid) clientConns.splice(i, 1);
+      }
+      // Se estiver numa partida em andamento, um bot assume o lugar
+      const gp = G && G.phase !== 'GAMEOVER' && G.phase !== 'ABANDONED' ? G.players.find(p => p.id === pid) : null;
+      if (gp) {
+        gp.type = 'bot';
+        gp.persona = 'medium';
+        gp.readySwap = true;
+        gp.disconnected = true;
+        broadcastState();
+        scheduleBotIfNeeded();
+      }
+      lobbySlots = lobbySlots.filter(s => s.id !== pid);
+      renderLobbySlots();
+      broadcastLobby();
     }
 
     /* ==========================================================================
@@ -557,12 +611,24 @@
       });
     }
 
+    function getDeviceId() {
+      let id = Store.get('sh_device_id');
+      if (!id) {
+        const rnd = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g, '').slice(0, 12) : Math.random().toString(36).slice(2, 14);
+        id = 'dev_' + rnd;
+        Store.set('sh_device_id', id);
+      }
+      return id;
+    }
+
     function handleClientLeft(conn) {
       const idx = clientConns.indexOf(conn);
       if (idx === -1) return;
       clientConns.splice(idx, 1);
       const pid = conn.__playerId;
-      if (!pid) return;
+      if (!pid || conn.__replaced || conn.__kicked) return;
+      // O mesmo aparelho já voltou por outra conexão: não é uma saída
+      if (clientConns.some(c => c.__playerId === pid)) return;
       const slot = lobbySlots.find(s => s.id === pid);
       const inGame = G && G.phase !== 'GAMEOVER' && G.phase !== 'ABANDONED' && G.players.some(p => p.id === pid);
       if (inGame) {
@@ -576,6 +642,7 @@
         if (G.phase === 'SWAP' && G.players.every(pl => pl.readySwap)) evaluateStartAndDirection();
         broadcastState();
         renderGame();
+        renderLobbySlots();
         scheduleBotIfNeeded();
       } else if (slot) {
         lobbySlots = lobbySlots.filter(s => s.id !== pid);
@@ -594,34 +661,39 @@
       SoundEngine.init();
       joinRoomCode = code;
       isHost = false;
-      // Mesmo id ao recarregar a página: o host devolve o seu lugar na mesa
-      const idKey = 'sh_peer_id_' + code;
-      myPlayerId = sessionStorage.getItem(idKey) || ('peer_' + Math.random().toString(36).substring(2, 9));
-      try { sessionStorage.setItem(idKey, myPlayerId); } catch (e) {}
+      // Identificador fixo deste aparelho/navegador: recarregar a página, a tela
+      // apagar ou o navegador fechar a aba não criam um jogador novo — o host
+      // reconhece o aparelho e devolve o mesmo lugar na mesa.
+      myPlayerId = getDeviceId();
 
+      // A conexão antiga vira "velha": o fechamento dela não dispara outra reconexão
+      if (hostConn) hostConn.__stale = true;
       if (myPeer) myPeer.destroy();
       clearTimeout(reconnectTimer);
       setNetStatus('join-net-status', `Conectando à sala ${code}...`, 'info');
       document.getElementById('join-box').style.display = 'flex';
       document.getElementById('inp-room-code').value = code;
-      myPeer = new Peer();
+      const peer = new Peer();
+      myPeer = peer;
 
-      myPeer.on('open', () => {
-        hostConn = myPeer.connect(PEER_PREFIX + code, CONN_OPTS);
+      peer.on('open', () => {
+        if (peer !== myPeer) return;
+        const conn = peer.connect(PEER_PREFIX + code, CONN_OPTS);
+        hostConn = conn;
         const timeout = setTimeout(() => {
-          if (!hostConn || !hostConn.open) setNetStatus('join-net-status', 'A conexão está demorando... Se não entrar, tente outra rede (Wi-Fi ↔ 4G).', 'warn');
+          if (!conn.open && conn === hostConn) setNetStatus('join-net-status', 'A conexão está demorando... Se não entrar, tente outra rede (Wi-Fi ↔ 4G).', 'warn');
         }, 9000);
-        hostConn.on('open', () => {
+        conn.on('open', () => {
           clearTimeout(timeout);
           const myName = document.getElementById('inp-name').value.trim() || 'Jogador';
           const avatar = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
-          hostConn.send({ type: 'JOIN', id: myPlayerId, name: myName, avatar });
+          conn.send({ type: 'JOIN', id: myPlayerId, name: myName, avatar });
           setNetStatus('join-net-status', `✔ Na sala ${code}! Aguardando o host iniciar.`, 'ok');
           setGuestLobbyMode(true);
         });
-        hostConn.on('data', (data) => handleClientReceive(data));
-        hostConn.on('close', () => handleHostLost());
-        hostConn.on('error', () => handleHostLost());
+        conn.on('data', (data) => { if (!conn.__stale) handleClientReceive(data); });
+        conn.on('close', () => { if (!conn.__stale) handleHostLost(); });
+        conn.on('error', () => { if (!conn.__stale) handleHostLost(); });
       });
 
       myPeer.on('error', (err) => {
@@ -630,8 +702,18 @@
       });
     }
 
+    // Celular voltou do modo de espera: se a conexão caiu, reconecta na hora
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || isHost || !joinRoomCode) return;
+      if (!hostConn || !hostConn.open) {
+        clearTimeout(reconnectTimer);
+        joinRoom(joinRoomCode);
+      }
+    });
+
     function handleHostLost() {
       if (isHost || !joinRoomCode) return;
+      if (hostConn) hostConn.__stale = true;
       showInvalidWarning('Conexão com o host perdida. Tentando voltar...');
       setNetStatus('join-net-status', 'Conexão perdida. Tentando voltar à sala...', 'warn');
       clearTimeout(reconnectTimer);
@@ -691,6 +773,16 @@
       if (!data || typeof data !== 'object') return;
       if (data.type === 'JOIN') {
         conn.__playerId = data.id;
+        // Mesmo aparelho reconectando: fecha a conexão antiga (sem tratar como saída)
+        clientConns.forEach(c => {
+          if (c !== conn && c.__playerId === data.id) {
+            c.__replaced = true;
+            try { c.close(); } catch (e) {}
+          }
+        });
+        for (let i = clientConns.length - 1; i >= 0; i--) {
+          if (clientConns[i].__replaced) clientConns.splice(i, 1);
+        }
         const name = String(data.name || 'Jogador').slice(0, 14);
         const avatar = typeof data.avatar === 'string' && data.avatar.length < 60000 ? data.avatar : AvatarModule.getDefaultAvatar('human', null);
 
@@ -765,6 +857,14 @@
         renderGame();
       } else if (data.type === 'REACTION') {
         showReaction(data.playerId, data.emoji);
+      } else if (data.type === 'KICKED') {
+        joinRoomCode = '';
+        if (hostConn) hostConn.__stale = true;
+        resetToLocalLobby();
+        setNetStatus('join-net-status', 'O host removeu você da sala.', 'error');
+        setGuestLobbyMode(false);
+        document.getElementById('screen-game').classList.remove('active');
+        document.getElementById('screen-lobby').classList.add('active');
       } else if (data.type === 'ROOM_FULL') {
         setNetStatus('join-net-status', 'A sala está cheia (6 jogadores).', 'error');
         joinRoomCode = '';
@@ -2200,8 +2300,70 @@
     document.getElementById('btn-mute-lobby').addEventListener('click', () => SoundEngine.toggleMute());
     document.getElementById('btn-mute-game').addEventListener('click', () => SoundEngine.toggleMute());
 
+    /* Câmera dentro do navegador: abrir o app de câmera do celular faz alguns
+       navegadores (ex.: Firefox no Android) descartarem a página por falta de
+       memória — ela recarrega e a foto se perde. Aqui a foto é tirada na própria página. */
+    let cameraStream = null;
+    let cameraFacing = 'user';
+
+    function stopCamera() {
+      if (cameraStream) cameraStream.getTracks().forEach(t => t.stop());
+      cameraStream = null;
+      document.getElementById('camera-video').srcObject = null;
+    }
+
+    async function startCamera() {
+      stopCamera();
+      const video = document.getElementById('camera-video');
+      const msg = document.getElementById('camera-msg');
+      msg.textContent = 'Abrindo a câmera...';
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: cameraFacing, width: { ideal: 640 }, height: { ideal: 640 } },
+          audio: false
+        });
+        video.srcObject = cameraStream;
+        video.classList.toggle('mirror', cameraFacing === 'user');
+        await video.play().catch(() => {});
+        msg.textContent = 'Centralize o rosto no círculo';
+      } catch (e) {
+        const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+        msg.textContent = denied
+          ? 'Permissão da câmera negada. Libere nas configurações do navegador ou use 📁 Arquivo.'
+          : 'Não foi possível abrir a câmera. Use 📁 Arquivo.';
+      }
+    }
+
+    function closeCameraModal() {
+      stopCamera();
+      document.getElementById('modal-camera').classList.remove('active');
+    }
+
     document.getElementById('btn-camera-photo').addEventListener('click', () => {
-      document.getElementById('inp-file-camera').click();
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext) {
+        document.getElementById('inp-file-camera').click(); // navegador sem suporte: app de câmera
+        return;
+      }
+      document.getElementById('modal-camera').classList.add('active');
+      startCamera();
+    });
+
+    document.getElementById('btn-camera-flip').addEventListener('click', () => {
+      cameraFacing = cameraFacing === 'user' ? 'environment' : 'user';
+      startCamera();
+    });
+
+    document.getElementById('btn-camera-cancel').addEventListener('click', closeCameraModal);
+
+    document.getElementById('btn-camera-shot').addEventListener('click', () => {
+      const video = document.getElementById('camera-video');
+      if (!cameraStream || !video.videoWidth) return;
+      const dataUrl = AvatarModule.drawableToAvatar(video, video.videoWidth, video.videoHeight, cameraFacing === 'user');
+      myCustomAvatar = dataUrl;
+      Store.set('sh_player_avatar', dataUrl);
+      syncMyAvatarPreview();
+      SoundEngine.select();
+      closeCameraModal();
     });
     document.getElementById('btn-gallery-photo').addEventListener('click', () => {
       document.getElementById('inp-file-gallery').click();
@@ -2303,6 +2465,10 @@
       const sim = document.getElementById('chk-sim-bots').checked;
       if (sim && clientConns.length > 0) {
         showInvalidWarning('Há jogadores conectados: desmarque "Simular só bots" para jogar com eles.');
+        return;
+      }
+      if (lobbySlots.length < 3) {
+        showInvalidWarning('São precisos pelo menos 3 jogadores: adicione um bot.');
         return;
       }
       if (clientConns.length > 0) keepScreenAwake(true);

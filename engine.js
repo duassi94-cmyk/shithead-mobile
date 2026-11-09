@@ -68,7 +68,7 @@
        ========================================================================== */
     const AppConfig = Object.freeze({
       VERSION: 'shithead-mobile-v5',
-      MAX_IMAGE_BYTES: 5 * 1024 * 1024, // 5 MB máximo na entrada
+      MAX_IMAGE_BYTES: 25 * 1024 * 1024, // 25 MB na entrada (fotos de celular passam de 5 MB); vira 96x96
       AVATAR_SIZE: 96,
       ALLOWED_MIMES: ['image/jpeg', 'image/png', 'image/webp'],
       SUITS: ['♠', '♥', '♦', '♣'],
@@ -145,43 +145,55 @@
         return DEFAULT_AVATARS.human;
       }
 
+      // Recorta o centro em quadrado e reduz para 96x96 (JPEG leve, ~3-5 KB)
+      function drawableToAvatar(source, srcW, srcH, mirror = false) {
+        const size = AppConfig.AVATAR_SIZE;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        const minDim = Math.min(srcW, srcH);
+        const sx = (srcW - minDim) / 2;
+        const sy = (srcH - minDim) / 2;
+        if (mirror) {
+          ctx.translate(size, 0);
+          ctx.scale(-1, 1);
+        }
+        ctx.drawImage(source, sx, sy, minDim, minDim, 0, 0, size, size);
+        return canvas.toDataURL('image/jpeg', 0.75);
+      }
+
+      // Lê a imagem por URL temporária (bem mais leve na memória do que ler
+      // o arquivo inteiro como texto: evita o navegador do celular travar/recarregar)
       function processImageFile(file, onSuccess, onError) {
         if (!file) return;
-        if (!AppConfig.ALLOWED_MIMES.includes(file.type)) {
-          onError('Formato inválido! Use imagens JPG, PNG ou WebP.');
+        const typeOk = !file.type || file.type.startsWith('image/');
+        if (!typeOk) {
+          onError('Formato inválido! Escolha uma foto (JPG, PNG ou WebP).');
           return;
         }
         if (file.size > AppConfig.MAX_IMAGE_BYTES) {
-          onError('Arquivo muito grande! O limite é de 5 MB.');
+          onError('Arquivo muito grande! O limite é de 25 MB.');
           return;
         }
-
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            const size = AppConfig.AVATAR_SIZE;
-            canvas.width = size;
-            canvas.height = size;
-            const ctx = canvas.getContext('2d');
-
-            const minDim = Math.min(img.width, img.height);
-            const sx = (img.width - minDim) / 2;
-            const sy = (img.height - minDim) / 2;
-
-            ctx.drawImage(img, sx, sy, minDim, minDim, 0, 0, size, size);
-            const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.72);
-            onSuccess(compressedDataUrl);
-          };
-          img.onerror = () => onError('Não foi possível ler a imagem selecionada.');
-          img.src = ev.target.result;
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          try {
+            onSuccess(drawableToAvatar(img, img.naturalWidth, img.naturalHeight));
+          } catch (e) {
+            onError('Não foi possível processar a imagem.');
+          }
+          URL.revokeObjectURL(url);
         };
-        reader.onerror = () => onError('Falha ao carregar o arquivo.');
-        reader.readAsDataURL(file);
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          onError('Não foi possível ler a imagem (formato HEIC não é suportado; use JPG).');
+        };
+        img.src = url;
       }
 
-      return { getDefaultAvatar, processImageFile };
+      return { getDefaultAvatar, processImageFile, drawableToAvatar };
     })();
 
     /* ==========================================================================

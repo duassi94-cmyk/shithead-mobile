@@ -16,6 +16,20 @@
 <body>
 
   <div id="fx-layer"></div>
+
+  <!-- Câmera dentro do navegador (sem abrir o app de câmera) -->
+  <div id="modal-camera" class="camera-modal">
+    <div class="camera-frame">
+      <video id="camera-video" autoplay playsinline muted></video>
+      <div class="camera-mask"></div>
+    </div>
+    <div id="camera-msg" class="camera-msg">Centralize o rosto no círculo</div>
+    <div class="camera-actions">
+      <button id="btn-camera-cancel" class="btn btn-secondary">Cancelar</button>
+      <button id="btn-camera-shot" class="btn btn-success camera-shot">📸 Tirar foto</button>
+      <button id="btn-camera-flip" class="btn btn-secondary" title="Trocar câmera">🔄</button>
+    </div>
+  </div>
   <div id="toast-warning">Jogada inválida!</div>
 
   <div class="app-shell">
@@ -46,7 +60,7 @@
               <input type="file" id="inp-file-gallery" accept="image/jpeg,image/png,image/webp" style="display:none;" />
             </div>
           </div>
-          <div style="font-size:0.7rem; color:var(--text-dim);">Formatos aceitos: JPG, PNG ou WebP (máx. 5 MB, ajustado automaticamente para 96x96px).</div>
+          <div style="font-size:0.7rem; color:var(--text-dim);">📷 Câmera tira a foto aqui mesmo no navegador. 📁 Arquivo aceita JPG, PNG ou WebP (ajustado para 96x96px).</div>
         </div>
 
         <!-- Conexão P2P -->

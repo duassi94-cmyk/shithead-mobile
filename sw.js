@@ -2,7 +2,7 @@
 // Estratégia "rede primeiro": sempre tenta baixar a versão mais nova do GitHub Pages
 // e só usa o cache quando estiver offline. Assim, cada atualização publicada
 // aparece para os jogadores sem precisar limpar o cache do navegador.
-const CACHE_NAME = 'shithead-mobile-v5';
+const CACHE_NAME = 'shithead-mobile-v5-b6';
 const ASSETS = [
   './',
   './index.html',
@@ -41,8 +41,10 @@ self.addEventListener('fetch', (event) => {
     return;
   }
   // Arquivos do jogo: rede primeiro, cache como reserva offline
+  // cache: 'no-cache' = sempre confere no servidor se há versão nova (evita misturar
+  // index.html novo com game.js antigo depois de uma atualização)
   event.respondWith(
-    fetch(req)
+    fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' })
       .then((resp) => {
         if (resp && resp.ok) {
           const copy = resp.clone();

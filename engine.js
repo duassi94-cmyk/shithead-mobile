@@ -70,7 +70,7 @@
       VERSION: 'shithead-mobile-v5',
       // Build publicado: data + número da publicação do dia. Atualizar a cada publicação
       // no GitHub para os logs dizerem exatamente qual código estava rodando.
-      BUILD: '2026-11-09.5',
+      BUILD: '2026-11-09.6',
       MAX_IMAGE_BYTES: 25 * 1024 * 1024, // 25 MB na entrada (fotos de celular passam de 5 MB); vira 96x96
       AVATAR_SIZE: 96,
       ALLOWED_MIMES: ['image/jpeg', 'image/png', 'image/webp'],
@@ -215,7 +215,8 @@
           r.p7 ? '7: próximo joga ≤ 7' : '7: sem poder',
           r.p10 ? `10: queima o monte e ${r.after10 === 'again' ? 'joga de novo' : 'passa a vez'}` : '10: sem poder',
           r.pjoker ? `Coringa: gira as mãos ${r.multijoker === 'per_joker' ? '1 vez por coringa' : '1 vez'}` : 'Coringa: fora do baralho',
-          r.p48 ? `${r.decks === 1 ? 4 : 8} iguais (${r.mode48 === 'together' ? 'juntas' : 'em sequência'}): invertem${r.burn48 ? ' e queimam o monte' : ''}` : 'Iguais: sem poder'
+          r.p48 ? `${r.decks === 1 ? 4 : 8} iguais (${r.mode48 === 'together' ? 'juntas' : 'em sequência'}): invertem${r.burn48 ? ' e queimam o monte' : ''}` : 'Iguais: sem poder',
+          `Monte grande a partir de ${r.bigPile || (r.decks === 2 ? 20 : 12)} cartas`
         ];
       }
 
@@ -829,6 +830,28 @@
         }
       }
 
+      // "Tum-tum" grave de coração quando o monte fica grande
+      function heartbeat() {
+        if (muted) return;
+        init();
+        if (!ctx) return;
+        const now = ctx.currentTime;
+        [0, 0.22, 0.9, 1.12].forEach((t, i) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(i % 2 ? 50 : 62, now + t);
+          osc.frequency.exponentialRampToValueAtTime(35, now + t + 0.18);
+          gain.gain.setValueAtTime(0.0001, now + t);
+          gain.gain.exponentialRampToValueAtTime(i % 2 ? 0.35 : 0.5, now + t + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + t + 0.2);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(now + t);
+          osc.stop(now + t + 0.22);
+        });
+      }
+
       function playByTag(tag) {
         switch (tag) {
           case 'BURN10': burn10(); break;
@@ -843,7 +866,7 @@
         }
       }
 
-      return { init, toggleMute, updateMuteButtons, select, slide, power2, power7, invalidError, gombra, alarm, playByTag };
+      return { init, toggleMute, updateMuteButtons, select, slide, power2, power7, invalidError, gombra, alarm, heartbeat, playByTag, isReady: () => !!ctx && ctx.state === 'running' };
     })();
 
     /* ==========================================================================
@@ -886,6 +909,8 @@
 
       function isCardPlayable(state, card) {
         const r = state.rules;
+        // 1º lance da partida: quem ganhou a saída abre obrigatoriamente com a sua menor carta
+        if (state.openingVal != null) return card.val === state.openingVal;
         if (card.isJoker && r.pjoker) return true;
         if (card.val === 10 && r.p10) return true;
         if (card.val === 15 && r.p2) return true;
@@ -936,6 +961,9 @@
 
       function getInvalidMoveReason(state, card) {
         const r = state.rules;
+        if (state.openingVal != null && card.val !== state.openingVal) {
+          return `Primeiro lance: abra com a sua menor carta (${state.openingLabel || state.openingVal}).`;
+        }
         if (state.constraint7 && r.p7 && card.val > 7) {
           return 'Regra do 7 ativa! Jogue uma carta menor ou igual a 7 (ou especial).';
         }
@@ -1170,8 +1198,13 @@
         const handIds = fromHand ? groupToPlay.map(c => c.id) : [];
         let openIds = fromHand ? [] : groupToPlay.map(c => c.id);
 
+        // Última(s) carta(s) da mão: junta as abertas da mesa de mesmo valor.
+        // Especiais (2, 10, Coringa) ficam guardados na mesa — valem mais jogados um a um —
+        // exceto quando juntar termina todas as cartas do bot.
         if (fromHand && deckEmpty && handIds.length === bot.hand.length && !best.sample.isJoker) {
-          openIds = bot.open.filter(c => !c.isJoker && c.val === best.sample.val).map(c => c.id);
+          const sameOpen = bot.open.filter(c => !c.isJoker && c.val === best.sample.val);
+          const endsGame = handIds.length + sameOpen.length === totalCards(bot);
+          if (!best.isSpecial || endsGame) openIds = sameOpen.map(c => c.id);
         }
 
         return { type: 'PLAY_CARDS', handIds, openIds };

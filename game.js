@@ -147,6 +147,9 @@
         turnCounter: num(st.turnCounter),
         pickupStamp: num(st.pickupStamp),
         lastPickupBy: pid(st.lastPickupBy),
+        openingVal: Number.isInteger(st.openingVal) && st.openingVal >= 2 && st.openingVal <= 16 ? st.openingVal : null,
+        openingLabel: st.openingVal != null && RANK_BY_LABEL[st.openingLabel] ? st.openingLabel : (st.openingVal === 16 ? 'Coringa' : null),
+        lastPickupCount: Math.min(250, Math.max(0, num(st.lastPickupCount))),
         turbo: !!st.turbo,
         stall: null
       };
@@ -167,8 +170,19 @@
         multijoker: r.multijoker === 'per_joker' ? 'per_joker' : 'once',
         p48: b(r.p48, true),
         mode48: r.mode48 === 'together' ? 'together' : 'sequence',
-        burn48: b(r.burn48, false)
+        burn48: b(r.burn48, false),
+        bigPile: sanitizeBigPile(r.bigPile, r.decks === 2 ? 2 : 1)
       };
+    }
+
+    // Monte grande: a partir de quantas cartas o monte gera tensão e o GOMBRA! vira "organismo vivo"
+    function defaultBigPile(decks) { return decks === 2 ? 20 : 12; }
+    function sanitizeBigPile(v, decks) {
+      const n = Math.round(Number(v));
+      return Number.isFinite(n) && n > 0 ? Math.min(99, Math.max(5, n)) : defaultBigPile(decks);
+    }
+    function bigPileThreshold() {
+      return (G && G.rules && G.rules.bigPile) || defaultBigPile(G && G.rules ? G.rules.decks : 1);
     }
 
     // Registros de partida (placar) recebidos do host
@@ -187,6 +201,13 @@
           place: Math.min(n, Math.max(1, Number(p && p.place) || n))
         }))
       };
+    }
+
+    // Vibra só depois de o jogador já ter tocado na página (antes disso o navegador bloqueia e reclama no console)
+    function safeVibrate(pattern) {
+      if (!navigator.vibrate) return;
+      if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;
+      try { navigator.vibrate(pattern); } catch (e) {}
     }
 
     const REACTIONS_OK = ['👍', '😂', '😱', '😡', '🔥', '💩', 'GOMBRA', 'DORMIU'];
@@ -208,6 +229,17 @@
       }
     }
 
+    // Carta simplificada: valor grande no canto (o que aparece com as cartas sobrepostas),
+    // naipe grande no centro e um selo pequeno nas cartas especiais (2, 7, 10, Coringa)
+    function powerIcon(card) {
+      const r = (G && G.rules) || {};
+      if (card.isJoker) return r.pjoker === false ? '' : '🔄';
+      if (card.val === 15 && r.p2 !== false) return '↺';
+      if (card.val === 10 && r.p10 !== false) return '🔥';
+      if (card.val === 7 && r.p7 !== false) return '↓';
+      return '';
+    }
+
     function createCardDOM(card, isFaceDown = false) {
       const el = document.createElement('div');
       if (isFaceDown || !card) {
@@ -216,18 +248,18 @@
       }
       const isFace = !card.isJoker && card.val >= 11 && card.val <= 13;
       el.className = 'playing-card' + (card.isRed ? ' red' : '') + (card.isJoker ? ' joker-card' : '') + (isFace ? ' face-card' : '');
+      const icon = powerIcon(card);
+      const badge = icon ? `<div class="card-power">${icon}</div>` : '';
       if (card.isJoker) {
         el.innerHTML = `
           <div class="card-corner"><span class="rank">★</span></div>
-          <div class="card-center">🃏</div>
-          <div class="card-corner-bot"><span class="rank">★</span></div>`;
+          <div class="card-center">🃏</div>${badge}`;
         return el;
       }
-      const center = isFace ? `${card.label}${card.suit}` : card.suit;
+      const center = isFace ? `<b>${card.label}</b>` : card.suit;
       el.innerHTML = `
         <div class="card-corner"><span class="rank">${card.label}</span><span class="suit">${card.suit}</span></div>
-        <div class="card-center">${center}</div>
-        <div class="card-corner-bot"><span class="rank">${card.label}</span><span class="suit">${card.suit}</span></div>`;
+        <div class="card-center">${center}</div>${badge}`;
       return el;
     }
 
@@ -271,7 +303,9 @@
 
     function getSeatRect(playerId) {
       if (playerId === myPlayerId) {
-        const el = document.getElementById('my-hand-cards');
+        // Mão aberta: a própria mão; recolhida: o leque no canto
+        const open = document.getElementById('player-zone')?.classList.contains('hand-open');
+        const el = document.getElementById(open ? 'my-hand-cards' : 'hand-dock');
         return el ? el.getBoundingClientRect() : null;
       }
       const seat = document.querySelector(`.seat[data-seat-id="${CSS.escape(playerId || '')}"] .seat-avatar`);
@@ -378,7 +412,12 @@
       if (!gBtn || !dBtn) return;
       const left = gombraRemainingMs();
       gBtn.disabled = left <= 0;
-      gBtn.textContent = left > 0 ? `GOMBRA! ${Math.ceil(left / 1000)}` : 'GOMBRA!';
+      // A contagem fica num espaço de largura fixa: o botão não muda de tamanho
+      const gTxt = left > 0 ? String(Math.ceil(left / 1000)) : '';
+      if (gBtn.dataset.count !== gTxt) {
+        gBtn.dataset.count = gTxt;
+        gBtn.innerHTML = `GOMBRA!<span class="gcount">${gTxt}</span>`;
+      }
       gBtn.title = left > 0 ? 'Liberado: alguém acabou de recolher o monte!' : 'Liberado por 10 s quando outro jogador recolhe o monte';
       const sleeper = sleepyPlayer();
       const cooling = Date.now() - lastDormiuAt < DORMIU_COOLDOWN_MS;
@@ -407,7 +446,10 @@
       if (emoji === 'GOMBRA') {
         const burst = document.createElement('div');
         burst.className = 'gombra-burst';
-        burst.innerHTML = `GOMBRA!<small>${p ? esc(p.name) : ''}</small>`;
+        // Se a compra que liberou o GOMBRA! foi de um monte grande, ele vira "organismo vivo"
+        const alive = G && (G.lastPickupCount || 0) >= bigPileThreshold();
+        burst.innerHTML = `GOMBRA!${alive ? '<span class="organismo">🦠 organismo vivo 🦠</span>' : ''}<small>${p ? esc(p.name) : ''}</small>`;
+        if (alive) burst.classList.add('gombra-alive');
         layer.appendChild(burst);
         SoundEngine.gombra();
         setTimeout(() => burst.remove(), 1900);
@@ -436,7 +478,7 @@
           SoundEngine.alarm();
           document.getElementById('player-zone')?.classList.add('wake-shake');
           setTimeout(() => document.getElementById('player-zone')?.classList.remove('wake-shake'), 1200);
-          if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200, 100, 400]); } catch (e) {} }
+          safeVibrate([200, 100, 200, 100, 400]);
         } else {
           SoundEngine.select();
         }
@@ -600,13 +642,26 @@
           document.getElementById('chk-p48').checked = r.p48 ?? true;
           document.getElementById('sel-48mode').value = r.mode48 || 'sequence';
           document.getElementById('chk-48burn').checked = r.burn48 ?? false;
+          document.getElementById('inp-bigpile').value = sanitizeBigPile(r.bigPile, r.decks === 2 ? 2 : 1);
         } catch (e) {}
       }
+      lastDecksForBigPile = parseInt(document.getElementById('sel-decks').value, 10) === 2 ? 2 : 1;
       renderScoreboard();
       renderLobbySlots();
       refreshLogPanelUI();
 
       autoJoinFromUrl();
+    }
+
+    // Ao trocar a quantidade de baralhos, o padrão acompanha (12 ↔ 20), a menos que o valor tenha sido editado
+    let lastDecksForBigPile = 1;
+    function syncBigPileInput(decks) {
+      const inp = document.getElementById('inp-bigpile');
+      let v = sanitizeBigPile(inp.value, decks);
+      if (decks !== lastDecksForBigPile && v === defaultBigPile(lastDecksForBigPile)) v = defaultBigPile(decks);
+      lastDecksForBigPile = decks;
+      if (String(inp.value) !== String(v)) inp.value = v;
+      return v;
     }
 
     function getRulesFromUI() {
@@ -640,7 +695,8 @@
         multijoker: document.getElementById('sel-multijoker').value,
         p48: document.getElementById('chk-p48').checked,
         mode48: document.getElementById('sel-48mode').value,
-        burn48: document.getElementById('chk-48burn').checked
+        burn48: document.getElementById('chk-48burn').checked,
+        bigPile: syncBigPileInput(decks)
       };
       Store.set('sh_rules', JSON.stringify(rules));
       return rules;
@@ -701,11 +757,11 @@
       };
     }
 
-    function computeStats(records) {
+    function computeStats(records, wantBots = false) {
       const stats = {};
       records.forEach(rec => {
         rec.players.forEach(p => {
-          if (!p.human) return;
+          if (p.human === wantBots) return;
           const s = stats[p.id] || (stats[p.id] = { id: p.id, name: p.name, played: 0, losses: 0, firsts: 0, placeSum: 0, lastAt: '' });
           s.played++;
           if (p.place === rec.n) s.losses++;
@@ -723,32 +779,52 @@
       return slot ? slot.avatar : AvatarModule.getDefaultAvatar('human', null);
     }
 
-    function leaderboardHtml(records, emptyText) {
+    // withBots: na sessão, os bots aparecem numa seção à parte, sem posição no ranking
+    function leaderboardHtml(records, emptyText, withBots = false) {
       const rows = computeStats(records);
-      if (rows.length === 0) return `<div class="board-empty">${emptyText}</div>`;
+      const botRows = withBots ? computeStats(records, true) : [];
+      if (rows.length === 0 && botRows.length === 0) return `<div class="board-empty">${emptyText}</div>`;
+      let html = rows.length ? statsTableHtml(rows, true) : `<div class="board-empty">${emptyText}</div>`;
+      if (botRows.length) html += `<div class="board-section-title">🤖 Bots (fora do ranking)</div>${statsTableHtml(botRows, false)}`;
+      return html;
+    }
+
+    function botAvatarForId(id) {
+      const slot = lobbySlots.find(s => s.id === id);
+      const gp = G && G.players.find(p => p.id === id);
+      const persona = (slot && slot.persona) || (gp && gp.persona) || 'medium';
+      return (slot && slot.avatar) || AvatarModule.getDefaultAvatar('bot', persona);
+    }
+
+    function statsTableHtml(rows, ranked) {
       const me = getDeviceId();
       return `<table class="board">
-        <thead><tr><th></th><th class="b-name">Jogador</th><th title="Partidas">P</th><th title="Vezes que foi o Shithead">💀</th><th title="% de derrotas">%</th><th title="Vezes que saiu em 1º">🥇</th><th title="Posição média de saída (1 = melhor)">Pos</th></tr></thead>
-        <tbody>${rows.map((s, i) => `
-          <tr class="${s.id === me ? 'b-me' : ''}">
-            <td class="b-rank">${i + 1}</td>
-            <td class="b-name"><img class="avatar-sm b-av" src="${esc(avatarForId(s.id))}" alt="" /><span>${esc(s.name)}${s.id === me ? ' <em>(você)</em>' : ''}</span></td>
+        <thead><tr><th></th><th class="b-name">${ranked ? 'Jogador' : 'Bot'}</th><th title="Partidas">P</th><th title="Vezes que foi o Shithead">💀</th><th title="% de derrotas">%</th><th title="Vezes que saiu em 1º">🥇</th><th title="Posição média de saída (1 = melhor)">Pos</th></tr></thead>
+        <tbody>${rows.map((s, i) => {
+          const isMe = ranked && s.id === me;
+          const av = ranked ? avatarForId(s.id) : botAvatarForId(s.id);
+          return `
+          <tr class="${isMe ? 'b-me' : (ranked ? '' : 'b-bot')}">
+            <td class="b-rank">${ranked ? i + 1 : '–'}</td>
+            <td class="b-name"><img class="avatar-sm b-av" src="${esc(av)}" alt="" /><span>${esc(s.name)}${isMe ? ' <em>(você)</em>' : ''}</span></td>
             <td>${s.played}</td>
             <td class="b-loss">${s.losses}</td>
             <td>${Math.round((s.losses / s.played) * 100)}%</td>
             <td>${s.firsts}</td>
             <td>${(s.placeSum / s.played).toFixed(1)}</td>
-          </tr>`).join('')}</tbody></table>`;
+          </tr>`;
+        }).join('')}</tbody></table>`;
     }
 
     function renderScoreboard() {
       const el = document.getElementById('scoreboard-list');
       if (!el) return;
+      if (document.getElementById('board-overlay')?.classList.contains('show')) renderBoardOverlay();
       document.querySelectorAll('[data-board]').forEach(b => b.classList.toggle('active', b.dataset.board === boardTab));
       const note = document.getElementById('lbl-board-note');
       const resetBtn = document.getElementById('btn-reset-scores');
       if (boardTab === 'session') {
-        el.innerHTML = leaderboardHtml(sessionRecords, 'Nenhuma partida nesta sessão ainda.');
+        el.innerHTML = leaderboardHtml(sessionRecords, 'Nenhuma partida nesta sessão ainda.', true);
         note.textContent = (joinRoomCode ? `Sala ${joinRoomCode}` : (roomCode ? `Sala ${roomCode}` : 'Partidas locais')) + ` · ${sessionRecords.length} partida(s) · zera ao abrir uma sala nova`;
         resetBtn.style.display = isHost ? 'inline-block' : 'none';
       } else {
@@ -811,23 +887,26 @@
             </div>
           `;
         } else {
-          div.innerHTML = `
+          // Bot: o seletor já mostra o nome (sem nome repetido sobreposto ao seletor)
+          div.innerHTML = isHost ? `
+            <div class="slot-left slot-left-bot">
+              <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
+              <img src="${esc(avatarSrc)}" class="avatar-sm" alt="" />
+              <select data-idx="${idx}" class="sel-bot-persona" title="Nível do bot">
+                <option value="easy" ${slot.persona === 'easy' ? 'selected' : ''}>Tio Barnabé (Fácil)</option>
+                <option value="medium" ${slot.persona === 'medium' ? 'selected' : ''}>Madame Lola (Médio)</option>
+                <option value="hard" ${slot.persona === 'hard' ? 'selected' : ''}>Dr. Chaos (Difícil)</option>
+                <option value="random">Aleatório</option>
+              </select>
+            </div>
+            ${lobbySlots.length > 3 ? `<button data-remove="${idx}" class="btn btn-danger" style="padding:3px 7px; font-size:0.72rem; flex-shrink:0;" title="Remover bot">X</button>` : ''}
+          ` : `
             <div class="slot-left">
               <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
               <img src="${esc(avatarSrc)}" class="avatar-sm" alt="" />
               <strong>${esc(slot.name)}</strong>
             </div>
-            <div style="display:flex; gap:6px; align-items:center;">
-              ${isHost ? `
-                <select data-idx="${idx}" class="sel-bot-persona" style="padding:3px 6px; font-size:0.74rem;">
-                  <option value="easy" ${slot.persona === 'easy' ? 'selected' : ''}>Tio Barnabé (Fácil)</option>
-                  <option value="medium" ${slot.persona === 'medium' ? 'selected' : ''}>Madame Lola (Médio)</option>
-                  <option value="hard" ${slot.persona === 'hard' ? 'selected' : ''}>Dr. Chaos (Difícil)</option>
-                  <option value="random">Aleatório</option>
-                </select>
-                ${lobbySlots.length > 3 ? `<button data-remove="${idx}" class="btn btn-danger" style="padding:3px 7px; font-size:0.72rem;">X</button>` : ''}
-              ` : `<span class="badge">IA</span>`}
-            </div>
+            <span class="badge" style="flex-shrink:0;">IA</span>
           `;
         }
         container.appendChild(div);
@@ -1783,11 +1862,19 @@
       SoundEngine.init();
       SoundEngine.slide();
       const rules = currentMode === 'tutorial'
-        ? { decks: 1, jokers: 1, p2: true, draw2: 1, p7: true, p10: true, after10: 'next', pjoker: true, multijoker: 'once', p48: true, mode48: 'sequence', burn48: false }
+        ? { decks: 1, jokers: 1, p2: true, draw2: 1, p7: true, p10: true, after10: 'next', pjoker: true, multijoker: 'once', p48: true, mode48: 'sequence', burn48: false, bigPile: 12 }
         : getRulesFromUI();
       let deck = RulesEngine.buildDeck(rules);
       const slots = buildSlotsForMode(currentMode);
-      if (currentMode === 'tutorial') deck = rigTutorialDeck(deck);
+      if (currentMode === 'tutorial') {
+        deck = rigTutorialDeck(deck); // o tutorial conta com você no 1º lugar
+      } else {
+        // Toda partida nova sorteia os lugares na mesa
+        for (let i = slots.length - 1; i > 0; i--) {
+          const k = Math.floor(Math.random() * (i + 1));
+          [slots[i], slots[k]] = [slots[k], slots[i]];
+        }
+      }
 
       const players = slots.map((slot, idx) => {
         const closed = deck.splice(0, 3);
@@ -1890,16 +1977,29 @@
       }
     }
 
+    // Reorganiza a mesa: quem começa e o 2º (próximas cartas mais baixas) sentam
+    // lado a lado; os demais mantêm a ordem em que estavam depois do 1º.
     function finalizeDirectionAndStart(firstIdx, secondIdx) {
       const n = G.players.length;
-      const cwDist = (secondIdx - firstIdx + n) % n;
-      const ccwDist = (firstIdx - secondIdx + n) % n;
-      G.direction = cwDist <= ccwDist ? 1 : -1;
-      G.turnIdx = firstIdx;
+      const first = G.players[firstIdx];
+      const second = G.players[secondIdx];
+      const rest = [];
+      for (let k = 1; k < n; k++) {
+        const p = G.players[(firstIdx + k) % n];
+        if (p !== second) rest.push(p);
+      }
+      G.players = [first, second, ...rest];
+      G.players.forEach((p, i) => { p.seatNumber = i + 1; });
+      G.direction = 1;
+      G.turnIdx = 0;
       G.phase = 'PLAY';
       G.tieContext = null;
-      const dirName = G.direction === 1 ? 'Horário' : 'Anti-Horário';
-      G.bannerText = `${G.players[firstIdx].name} começa! (Sentido ${dirName})`;
+      // 1º lance obrigatório com a menor carta (a que deu a saída)
+      const openCard = first.hand.reduce((a, c) => (c.val < a.val ? c : a), first.hand[0]);
+      G.openingVal = openCard ? openCard.val : null;
+      G.openingLabel = openCard ? (openCard.isJoker ? 'Coringa' : openCard.label) : null;
+      G.bannerText = `${first.name} abre com ${G.openingLabel}; ${second.name} joga em seguida!`;
+      nlog('seating', { order: G.players.map(p => shortId(p.id)) });
       SoundEngine.power2();
       broadcastState();
       renderGame();
@@ -2059,6 +2159,7 @@
         G.discard.forEach(c => { c.public = true; }); // todos viram o que foi recolhido
         G.pickupStamp = Date.now() + Math.random();       // libera o GOMBRA! por 10 s
         G.lastPickupBy = player.id;
+        G.lastPickupCount = count;                         // monte grande → "organismo vivo"
         player.hand.push(...G.discard);
         G.discard = [];
         G.discardPlayGroups = [];
@@ -2101,6 +2202,7 @@
           G.discard.forEach(c => { c.public = true; });
           G.pickupStamp = Date.now() + Math.random();
           G.lastPickupBy = player.id;
+          G.lastPickupCount = count;
           player.hand.push(...G.discard);
           G.discard = [];
           G.discardPlayGroups = [];
@@ -2147,6 +2249,8 @@
 
     function processPlayedCards(player, cardsPlayed, fromRect = null, sourceAction = 'PLAY', handBefore = [], openBefore = []) {
       const r = G.rules;
+      G.openingVal = null; // o lance de abertura já foi feito
+      G.openingLabel = null;
       const sample = cardsPlayed[0];
       const countPlayed = cardsPlayed.length;
       const topBefore = G.discard.length > 0
@@ -2338,8 +2442,10 @@
       refillHandAtTurnStart(samePlayerAgain);
       updateStallTracker();
 
-      broadcastState(fx);
-      renderGame();
+      if (turboShouldPaint()) {
+        broadcastState(fx);
+        renderGame();
+      }
       scheduleBotIfNeeded();
     }
 
@@ -2373,11 +2479,30 @@
       const current = G.players[G.turnIdx];
       if (!current || current.type !== 'bot') return;
 
-      aiTimeout = setTimeout(() => {
+      const run = () => {
         if (!G || G.phase !== 'PLAY' || coachOpen) return;
         const decision = AIEngine.decideTurnAction(G, G.turnIdx);
         if (decision) executePlayerAction(current.id, decision);
-      }, turboMode ? TURBO_DELAY_MS : BOT_DELAY_MS);
+      };
+      if (turboMode) {
+        // Acelerado: próxima jogada imediatamente (MessageChannel não sofre o atraso mínimo de 4 ms dos timers)
+        const mc = new MessageChannel();
+        mc.port1.onmessage = run;
+        mc.port2.postMessage(0);
+        return;
+      }
+      aiTimeout = setTimeout(run, BOT_DELAY_MS);
+    }
+
+    // No modo acelerado, redesenhar/enviar a mesa a cada jogada é o que mais pesa:
+    // limita a ~8 atualizações por segundo (o fim da partida sempre é enviado)
+    let lastTurboPaint = 0;
+    function turboShouldPaint() {
+      if (!turboMode || !G || G.phase !== 'PLAY') return true;
+      const now = Date.now();
+      if (now - lastTurboPaint < 120) return false;
+      lastTurboPaint = now;
+      return true;
     }
 
     /* ==========================================================================
@@ -2515,7 +2640,7 @@
       selectedHandIds.clear();
       selectedOpenIds.clear();
       same.forEach(c => selectedHandIds.add(c.id));
-      if (navigator.vibrate) { try { navigator.vibrate(30); } catch (e) {} }
+      safeVibrate(30);
       SoundEngine.select();
       renderGame();
     }
@@ -2671,7 +2796,7 @@
        ========================================================================== */
     // 💀 -X ao lado de cada jogador: derrotas nesta sessão da sala
     function scoreFor(player) {
-      if (!player || (player.type === 'bot' && !player.disconnected)) return '';
+      if (!player) return '';
       const map = isHost ? sessionLossesForTable() : ((G && G.sessionLosses) || {});
       const v = map[player.id] || 0;
       return v > 0 ? `💀 -${v}` : '';
@@ -2694,9 +2819,12 @@
         const node = document.createElement('div');
         const isCurrent = G.phase === 'PLAY' && idx === G.turnIdx;
         const isNext = G.phase === 'PLAY' && idx === nextIdx && idx !== G.turnIdx;
-        node.className = 'seq-node' + (isCurrent ? ' seq-active' : '') + (isNext ? ' seq-next' : '') + (p.escaped ? ' seq-escaped' : '');
+        // Só quem está jogando mostra o nome; os demais aparecem pelo avatar (cabe em qualquer celular)
+        const compact = G.phase === 'PLAY' ? !isCurrent : n > 3;
+        node.className = 'seq-node' + (isCurrent ? ' seq-active' : '') + (isNext ? ' seq-next' : '') + (p.escaped ? ' seq-escaped' : '') + (compact ? ' seq-compact' : '');
+        node.title = p.name + (isCurrent ? ' — vez' : (isNext ? ' — próximo' : ''));
         const avatarSrc = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
-        const tag = isCurrent ? ' · VEZ' : (isNext ? ' · PRÓX' : '');
+        const tag = isCurrent ? ' · VEZ' : '';
         node.innerHTML = `<img src="${esc(avatarSrc)}" alt="" /><span>${idx === meIdx && G.mode !== 'sim' ? 'Você' : esc(p.name.split(' ')[0])}${tag}</span>`;
         seqBar.appendChild(node);
         if (k < n - 1) {
@@ -2709,13 +2837,17 @@
     }
 
     // Posições dos adversários num arco elíptico (o jogador local fica na base)
-    function seatPositions(count) {
+    // compact: mesa apertada → arco mais achatado (assentos laterais mais altos, longe das pilhas)
+    function seatPositions(count, compact = false) {
       const out = [];
+      const drop = compact ? 14 : 36;
+      // Mesa apertada com 4+ adversários: espaçamento horizontal uniforme (ninguém encosta no vizinho)
+      const even = compact && count >= 4;
       for (let i = 0; i < count; i++) {
         const theta = Math.PI + (i + 1) * (Math.PI / (count + 1)); // de 180° (esquerda) a 360° (direita) pelo topo
         out.push({
-          left: 50 + 41 * Math.cos(theta),
-          top: 1 + 36 * (1 + Math.sin(theta)) // âncora no topo do assento
+          left: even ? ((i + 0.5) * 100) / count : 50 + 41 * Math.cos(theta),
+          top: 1 + drop * (1 + Math.sin(theta)) // âncora no topo do assento
         });
       }
       return out;
@@ -2725,7 +2857,14 @@
       const oppArea = document.getElementById('opponents-area');
       oppArea.innerHTML = '';
       const total = G.players.length;
-      const positions = seatPositions(total - 1);
+      // Mesa apertada (celular pequeno ou muitos jogadores): assentos compactos
+      const opp = total - 1;
+      const aw = oppArea.clientWidth, ah = oppArea.clientHeight;
+      const compact = ah < 380 || (opp >= 4 && aw < 520) || (opp >= 3 && aw < 380 && ah < 460);
+      oppArea.classList.toggle('seats-compact', compact);
+      // Largura de cada assento compacto: cabe exatamente no espaço de cada um
+      oppArea.style.setProperty('--seat-w', compact ? `${Math.max(58, Math.min(76, Math.floor(oppArea.clientWidth / opp) - 4))}px` : '');
+      const positions = seatPositions(opp, compact);
       for (let offset = 1; offset < total; offset++) {
         // Sentido horário na tela: a partir de você (base) → esquerda → topo → direita
         const idx = (myIdx + offset) % total;
@@ -2756,7 +2895,7 @@
             <span class="skull-badge">${scoreFor(p)}</span>
             <span class="seat-hand-pill" title="Cartas na mão">${p.hand.length}</span>
           </div>
-          <div class="seat-name">${esc(p.name)}</div>
+          <div class="seat-name" title="${esc(p.name)}">${esc(p.type === 'bot' ? p.name.replace(/\s*\((Fácil|Médio|Difícil)\)\s*$/, '') : p.name)}</div>
           <div class="opp-mini-table">${miniTable}</div>
           <div class="seat-status">${status}</div>`;
         oppArea.appendChild(seat);
@@ -2796,11 +2935,26 @@
       }
     }
 
+    let wasPileTense = false;
     function renderDiscardPileMessy() {
       const discardEl = document.getElementById('discard-pile-visual');
       discardEl.innerHTML = '';
       const totalCards = G.discard.length;
-      document.getElementById('lbl-discard-badge').textContent = `Monte ${totalCards}`;
+      const badge = document.getElementById('lbl-discard-badge');
+      badge.textContent = `Monte ${totalCards}`;
+      // Tensão: a partir do limite, o feltro pulsa em vermelho e acelera conforme o monte cresce
+      const limit = bigPileThreshold();
+      const tense = totalCards >= limit && G.phase === 'PLAY';
+      const tension = tense ? Math.min(1, (totalCards - limit) / limit) : 0;
+      const felt = document.getElementById('center-drop-zone');
+      felt.classList.toggle('pile-tension', tense);
+      felt.style.setProperty('--tension', tension.toFixed(2));
+      discardEl.classList.toggle('pile-tension', tense);
+      discardEl.style.setProperty('--tension', tension.toFixed(2));
+      badge.classList.toggle('pile-hot', tense);
+      if (tense) badge.textContent = `🔥 Monte ${totalCards} 🔥`;
+      if (tense && !wasPileTense && !turboMode) SoundEngine.heartbeat();
+      wasPileTense = tense;
       if (totalCards === 0) return;
 
       const groups = G.discardPlayGroups && G.discardPlayGroups.length > 0
@@ -2832,12 +2986,6 @@
           const angle = -16 + idx * 7 + cardJitter(c, 'p') * 6;
           dom.style.transform = `translate(${-20 + idx * 9}px, ${-6 + idx * 2}px) rotate(${angle.toFixed(1)}deg) scale(0.95)`;
           dom.style.filter = 'brightness(0.82)';
-          if (idx === penultimateGroup.cards.length - 1) {
-            const tag = document.createElement('div');
-            tag.className = 'discard-play-tag';
-            tag.textContent = `${penultimateGroup.playerName.split(' ')[0]} ${penultimateGroup.cards.length}x`;
-            dom.appendChild(tag);
-          }
           discardEl.appendChild(dom);
         });
       }
@@ -2850,14 +2998,72 @@
         const angle = (cardJitter(c, 'l') * 26 - 13);
         dom.style.transform = `translate(${baseX + idx * 11}px, ${baseY + (idx % 2 ? -3 : 2)}px) rotate(${angle.toFixed(1)}deg)`;
         dom.style.boxShadow = '0 6px 14px rgba(0,0,0,0.55)';
-        if (idx === lastGroup.cards.length - 1) {
-          const tag = document.createElement('div');
-          tag.className = 'discard-play-tag tag-latest';
-          tag.textContent = `${(lastGroup.playerName || 'Topo').split(' ')[0]} ${lastGroup.cards.length}x`;
-          dom.appendChild(tag);
-        }
         discardEl.appendChild(dom);
       });
+
+      // Selos "quem jogou": fora das cartas (que são giradas) para nunca ficarem escondidos
+      // atrás da carta de cima — penúltima jogada à esquerda, última à direita
+      if (penultimateGroup) {
+        const tag = document.createElement('div');
+        tag.className = 'discard-play-tag tag-prev';
+        tag.textContent = `${penultimateGroup.playerName.split(' ')[0]} ${penultimateGroup.cards.length}x`;
+        discardEl.appendChild(tag);
+      }
+      const lastTag = document.createElement('div');
+      lastTag.className = 'discard-play-tag tag-latest';
+      lastTag.textContent = `${(lastGroup.playerName || 'Topo').split(' ')[0]} ${lastGroup.cards.length}x`;
+      discardEl.appendChild(lastTag);
+    }
+
+    // Mão recolhida/aberta (a camada ampliada fica sobre a mesa e não empurra o layout)
+    let handOpen = false;
+    let lastHandKey = '';
+    function setHandOpen(open) {
+      handOpen = !!open;
+      document.getElementById('player-zone').classList.toggle('hand-open', handOpen);
+      placeTableCards();
+    }
+
+    // Cartas da mesa: no feltro com a mão recolhida; dentro da camada com a mão ampliada
+    function placeTableCards() {
+      const el = document.getElementById('my-table-cards');
+      const target = document.getElementById(handOpen ? 'layer-table-slot' : 'my-table-slot');
+      if (el && target && el.parentElement !== target) target.appendChild(el);
+    }
+
+    function renderHandDock(me, sortedHand, hideHand, isMyTurn) {
+      const fan = document.getElementById('dock-fan');
+      const label = document.getElementById('dock-label');
+      const dock = document.getElementById('hand-dock');
+      const n = sortedHand.length;
+      // Miniatura: cada valor aparece uma vez só (repetidas viram "×2", "×3"...)
+      const groups = [];
+      sortedHand.forEach(c => {
+        const key = c.isJoker ? 'J' : c.val;
+        const g = groups.find(x => x.key === key);
+        if (g) g.n++;
+        else groups.push({ key, label: c.isJoker ? '★' : c.label, joker: !!c.isJoker, red: !c.isJoker && c.isRed, n: 1 });
+      });
+      const cardHtml = g => `<span class="dock-card${g.joker ? ' joker' : ''}">${esc(g.label)}${g.n > 1 ? `<i>×${g.n}</i>` : ''}</span>`;
+      const items = hideHand ? (n ? ['<span class="dock-card back"></span>'] : []) : groups.map(cardHtml);
+      // Espaçamento: as miniaturas se sobrepõem só o necessário para caber na largura (fixa) do leque;
+      // se não couber legível numa linha, usa duas
+      const cardW = 24;
+      const avail = fan.clientWidth;
+      const fitStep = (k) => (k > 1 ? (avail - cardW) / (k - 1) : cardW);
+      const twoRows = items.length > 1 && fitStep(items.length) < 13;
+      const perRow = twoRows ? Math.ceil(items.length / 2) : items.length;
+      const step = Math.max(10, Math.min(cardW + 3, fitStep(perRow)));
+      fan.style.setProperty('--dock-step', `${step.toFixed(1)}px`);
+      fan.classList.toggle('two-rows', twoRows);
+      fan.innerHTML = twoRows
+        ? `<span class="dock-row">${items.slice(0, perRow).join('')}</span><span class="dock-row">${items.slice(perRow).join('')}</span>`
+        : `<span class="dock-row">${items.join('')}</span>`;
+      label.innerHTML = me.escaped ? '✔ Escapou'
+        : `${isMyTurn ? '<span class="dock-turn">⚡ Vez</span>' : ''}<span class="dock-n">${n}</span><span class="dock-sub">na mão</span>`;
+      dock.title = handOpen ? 'Recolher a mão' : 'Ampliar a mão';
+      dock.disabled = n === 0 || hideHand;
+      dock.style.visibility = me.escaped && n === 0 ? 'hidden' : 'visible';
     }
 
     function renderGame() {
@@ -2874,7 +3080,9 @@
       const isMyTurn = !spectator && G.turnIdx === myIdx && G.phase === 'PLAY';
       const nextIdx = G.phase === 'PLAY' ? RulesEngine.getNextActivePlayerIndex(G, G.turnIdx) : -1;
 
-      document.getElementById('lbl-direction').textContent = G.direction === 1 ? '↻ Horário' : '↺ Anti-horário';
+      const dirEl = document.getElementById('lbl-direction');
+      dirEl.innerHTML = G.direction === 1 ? '↻<span class="dir-text"> Horário</span>' : '↺<span class="dir-text"> Anti-horário</span>';
+      dirEl.title = G.direction === 1 ? 'Sentido horário' : 'Sentido anti-horário';
 
       let constraintTxt = 'Monte livre';
       let hot = false;
@@ -2961,7 +3169,28 @@
         myHandEl.appendChild(hDom);
       });
       myHandEl.appendChild(Object.assign(document.createElement('div'), { className: 'hand-spacer' }));
+      // Sobrepõe as cartas quando não cabem todas lado a lado
+      const cw = parseFloat(getComputedStyle(myHandEl).getPropertyValue('--card-w')) || 58;
+      myHandEl.classList.toggle('hand-dense', sortedHand.length * (cw + 6) > myHandEl.clientWidth - 16);
       myHandEl.scrollLeft = prevScroll;
+
+      // Mão recolhida no canto (leque pequeno) + abertura automática na sua vez
+      renderHandDock(me, sortedHand, hideHand, isMyTurn);
+      const wantOpen = !spectator && me.hand.length > 0 &&
+        ((G.phase === 'PLAY' && isMyTurn) || (G.phase === 'SWAP' && !me.readySwap));
+      // Muda só quando começa/termina a SUA vez (ou a fase): fora da vez, se você abrir a mão ela fica aberta
+      const handKey = `${G.phase}|${wantOpen ? 'on' + (G.turnCounter || 0) : 'off'}`;
+      if (handKey !== lastHandKey) { lastHandKey = handKey; handOpen = wantOpen; }
+      if (me.hand.length === 0 || hideHand) handOpen = false;
+      zone.classList.toggle('hand-open', handOpen);
+      zone.classList.toggle('spectating', spectator);
+      placeTableCards();
+      document.getElementById('my-table-slot').classList.toggle('no-cards', me.open.length + me.closed.length === 0);
+      // Jogando pelas cartas da mesa (mão vazia): destaque no feltro
+      document.getElementById('table-area').classList.toggle('player-zone-turn-table', isMyTurn && me.hand.length === 0 && !me.escaped);
+      document.getElementById('lbl-hand-layer').textContent = G.phase === 'SWAP'
+        ? 'Troca: toque na mão e depois numa aberta'
+        : (isMyTurn ? `Sua vez · ${me.hand.length} na mão` : `Sua mão · ${me.hand.length}`);
 
       // Botões de ação
       const btnReady = document.getElementById('btn-ready-swap');
@@ -2989,7 +3218,8 @@
         const pickupStatus = RulesEngine.canPlayerPickupPile(G, me);
         btnPickup.disabled = !isMyTurn || G.discard.length === 0;
         if (isMyTurn && !RulesEngine.hasAnyPlayableMove(G, me) && G.discard.length > 0) {
-          btnPickup.textContent = 'Recolher Monte (sem jogada)';
+          btnPickup.textContent = '😬 Recolher Monte'; // curto: não pode quebrar em 2 linhas no celular
+          btnPickup.title = 'Sem jogada válida: recolha o monte';
           btnPickup.classList.add('pulse-btn');
         } else {
           btnPickup.textContent = (pickupStatus.allowed || G.discard.length === 0) ? 'Pegar Monte' : '🔒 Monte bloqueado';
@@ -3040,9 +3270,9 @@
         }).join('');
         document.getElementById('gameover-scores').innerHTML =
           `<div class="podium">${podium}</div>` +
-          (G.mode === 'normal' ? `<div class="board-title">Placar da sessão</div>${leaderboardHtml(sessionRecords, 'O placar aparece após a primeira partida.')}` : '');
+          (G.mode === 'normal' ? `<div class="board-title">Placar da sessão</div>${leaderboardHtml(sessionRecords, 'O placar aparece após a primeira partida.', true)}` : '');
         document.getElementById('btn-rematch').style.display = isHost ? 'block' : 'none';
-        if (!wasActive && navigator.vibrate && loserIsMe) { try { navigator.vibrate([80, 60, 160]); } catch (e) {} }
+        if (!wasActive && loserIsMe) safeVibrate([80, 60, 160]);
       } else {
         overModal.classList.remove('active');
       }
@@ -3130,6 +3360,7 @@
 
       if (G.phase === 'SWAP') {
         coachSay('welcome', '<b>Bem-vindo ao Shithead!</b> O objetivo é <b>não ser o último</b> com cartas. Você tem 3 cartas fechadas, 3 abertas na mesa e 3 na mão.') ||
+        coachSay('ranks', '<b>Ordem das cartas</b>, da menor para a maior:<br><b>3 · 4 · 5 · 6 · 7 · 8 · 9 · J · Q · K · A</b><br>Você joga uma carta <b>igual ou maior</b> que a do topo. Os <b>especiais</b> fogem dessa regra: o <b>2</b> e o <b>10</b> entram sobre qualquer carta, o <b>7</b> obriga o próximo a jogar ≤ 7 e o <b>Coringa</b> 🃏 gira as mãos.') ||
         coachSay('swap', 'Antes de começar, você pode <b>trocar</b> cartas da mão com as abertas. Dica: deixe cartas fortes (<b>2, 10, A</b>) na mesa para o final. Toque numa carta da mão e depois numa aberta. Quando terminar, toque em <b>Pronto</b>.');
         return;
       }
@@ -3147,6 +3378,29 @@
       if (G.burnedCount > 0) {
         if (coachSay('burned', 'O monte foi <b>queimado</b> 🔥 e as cartas saíram do jogo (pilha "Fora", à direita).')) return;
       }
+      // Início da partida: como foi decidida a ordem de jogada
+      if (G.openingVal != null) {
+        const first = G.players[0];
+        const second = G.players[1];
+        const iStart = first && first.id === me.id;
+        if (coachSay('start-order',
+          '<b>Quem começa?</b> Quem tem a <b>menor carta</b> na mão abre a partida, e quem tem a <b>segunda menor</b> joga logo depois — por isso a mesa foi reorganizada, com os dois lado a lado. Em caso de empate, vence quem tocar primeiro no duelo de velocidade.<br>' +
+          (iStart
+            ? `Você tem a menor carta, então <b>você começa</b>! O primeiro lance é <b>obrigatoriamente</b> com ela (<b>${esc(G.openingLabel || '')}</b>); se tiver mais de uma igual, pode jogar todas juntas.`
+            : `Quem abre é <b>${esc(first ? first.name : '')}</b>, obrigatoriamente com a menor carta (<b>${esc(G.openingLabel || '')}</b>), e em seguida <b>${esc(second ? second.name : '')}</b>.`))) return;
+      }
+      // Depois do lance de abertura: como as cartas de cada jogador vão acabando
+      if ((G.turnCounter || 0) >= 1 && coachSay('progression',
+        '<b>Como as suas cartas vão acabando:</b><br>' +
+        '1️⃣ <b>Mão + baralho:</b> enquanto houver baralho de compra, depois de jogar você compra até ficar com <b>3 na mão</b>.<br>' +
+        '2️⃣ <b>Baralho acabou:</b> você para de comprar e a mão vai diminuindo.<br>' +
+        '3️⃣ <b>Mão vazia:</b> jogue as <b>3 abertas</b> da mesa (dá para juntar a última da mão com abertas do mesmo valor).<br>' +
+        '4️⃣ <b>Por último, as 3 fechadas</b>, no escuro: se a carta virada não servir, você recolhe o monte e volta a jogar pela mão.<br>' +
+        'Zerou tudo? Você <b>escapou</b>! O último que sobrar com cartas é o <b>Shithead</b> 💩.')) return;
+      // A mão recolhida (miniatura embaixo) e a mão ampliada
+      if (!isMyTurn && !handOpen && me.hand.length > 0 && (G.turnCounter || 0) >= 2 && coachSay('dock',
+        'Fora da sua vez a mão fica <b>recolhida</b> embaixo: a miniatura mostra cada valor que você tem (×2 = repetida). ' +
+        '<b>Toque nela para ampliar</b>. Na sua vez ela abre sozinha, com as suas cartas da mesa em cima.')) return;
       if (!isMyTurn) return;
 
       if (coachSay('first-turn', 'É a <b>sua vez</b>! Jogue uma carta <b>igual ou maior</b> que a do topo (as que podem ser jogadas brilham em verde). Toque para selecionar e depois em <b>Jogar</b>, ou toque duas vezes, ou arraste até a mesa.')) return;
@@ -3160,7 +3414,7 @@
         if (coachSay('pickup', 'Sem jogada válida? Então você precisa <b>recolher o monte</b> (botão vermelho). Faz parte do jogo! 😅')) return;
       }
       if (G.deck.length === 0 && coachSay('deck-empty', 'O <b>baralho de compra acabou</b>. Quando sua mão zerar, jogue as cartas <b>abertas</b> da mesa e por último as <b>fechadas</b>, no escuro: se a carta virada não servir, você recolhe o monte.')) return;
-      if (top && top.val >= 11 && coachSay('high-top', `O topo está alto (${top.label}). Se não tiver carta maior, use um <b>2</b> ou <b>10</b>, ou recolha o monte.`)) return;
+      if (top && !top.isJoker && top.val >= 11 && top.val <= 14 && !G.freePlayAfter2 && coachSay('high-top', `O topo está alto (${top.label}). Se não tiver carta maior, use um <b>2</b> ou <b>10</b>, ou recolha o monte.`)) return;
     }
 
     /* ==========================================================================
@@ -3168,6 +3422,21 @@
        ========================================================================== */
     document.getElementById('btn-mute-lobby').addEventListener('click', () => SoundEngine.toggleMute());
     document.getElementById('btn-mute-game').addEventListener('click', () => SoundEngine.toggleMute());
+    // 🏆 na mesa: placar da sessão (bots aparecem à parte, fora do ranking)
+    function renderBoardOverlay() {
+      const list = document.getElementById('board-overlay-list');
+      list.innerHTML = leaderboardHtml(sessionRecords, 'Nenhuma partida terminada nesta sessão ainda.', true);
+      const room = joinRoomCode || roomCode;
+      document.getElementById('lbl-board-overlay-note').textContent =
+        (room ? `Sala ${room}` : 'Partidas locais') + ` · ${sessionRecords.length} partida(s) · simulação e tutorial não contam`;
+    }
+    document.getElementById('btn-board-game').addEventListener('click', () => {
+      renderBoardOverlay();
+      document.getElementById('board-overlay').classList.add('show');
+    });
+    const closeBoardOverlay = () => document.getElementById('board-overlay').classList.remove('show');
+    document.getElementById('btn-board-close').addEventListener('click', closeBoardOverlay);
+    document.getElementById('board-overlay').addEventListener('click', (e) => { if (e.target.id === 'board-overlay') closeBoardOverlay(); });
 
     /* Câmera dentro do navegador: abrir o app de câmera do celular faz alguns
        navegadores (ex.: Firefox no Android) descartarem a página por falta de
@@ -3272,6 +3541,8 @@
     };
     ['chk-p10', 'chk-p48', 'chk-48burn'].forEach(id => document.getElementById(id).addEventListener('change', syncBurnWarning));
     setTimeout(syncBurnWarning, 0);
+    document.getElementById('sel-decks').addEventListener('change', (e) => syncBigPileInput(e.target.value === '2' ? 2 : 1));
+    document.getElementById('inp-bigpile').addEventListener('change', () => getRulesFromUI());
 
     document.getElementById('inp-file-camera').addEventListener('change', handleAvatarInput);
     document.getElementById('inp-file-gallery').addEventListener('change', handleAvatarInput);
@@ -3408,6 +3679,8 @@
     });
 
     // Mouse: a roda rola a mão na horizontal (desktop)
+    document.getElementById('hand-dock').addEventListener('click', () => setHandOpen(!handOpen));
+    document.getElementById('btn-hand-close').addEventListener('click', () => setHandOpen(false));
     document.getElementById('my-hand-cards').addEventListener('wheel', (e) => {
       const el = e.currentTarget;
       if (el.scrollWidth <= el.clientWidth) return;
@@ -3471,5 +3744,15 @@
     setInterval(() => {
       if (document.getElementById('screen-lobby').classList.contains('active')) refreshLogPanelUI();
     }, 5000);
+
+    // Libera o áudio no primeiro gesto em qualquer lugar da página (ex.: convidado que
+    // entrou pelo link e só rolou a tela). Chrome/Firefox/Safari só aceitam o desbloqueio
+    // em pointerup/touchend/click/keydown — o pointerdown de um toque não conta.
+    const AUDIO_UNLOCK_EVENTS = ['pointerup', 'touchend', 'click', 'keydown'];
+    const unlockAudio = () => {
+      SoundEngine.init();
+      if (SoundEngine.isReady()) AUDIO_UNLOCK_EVENTS.forEach(ev => document.removeEventListener(ev, unlockAudio, true));
+    };
+    AUDIO_UNLOCK_EVENTS.forEach(ev => document.addEventListener(ev, unlockAudio, { capture: true, passive: true }));
 
     loadSavedSetup();

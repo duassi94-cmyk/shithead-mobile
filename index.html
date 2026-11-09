@@ -108,14 +108,14 @@
         <!-- Regras da Partida -->
         <div class="card-box" id="box-rules">
           <h2>Regras da Partida</h2>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-decks">Número de Baralhos:</label>
             <select id="sel-decks">
               <option value="1">1 Baralho</option>
               <option value="2">2 Baralhos</option>
             </select>
           </div>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-jokers">Quantidade de Coringas:</label>
             <select id="sel-jokers">
               <option value="0">0 Coringas</option>
@@ -129,7 +129,7 @@
             <label for="chk-p2">Poder do 2 (Joga sobre tudo + Joga novamente livre):</label>
             <input type="checkbox" id="chk-p2" checked />
           </div>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-draw2">Se zerar a mão com o 2 (com baralho):</label>
             <select id="sel-draw2">
               <option value="1" selected>Comprar 1 carta (Padrão)</option>
@@ -144,7 +144,7 @@
             <label for="chk-p10">Poder do 10 (Queima o monte a qualquer momento):</label>
             <input type="checkbox" id="chk-p10" checked />
           </div>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-after10">Após jogar o 10:</label>
             <select id="sel-after10">
               <option value="next" selected>Próximo jogador (Padrão)</option>
@@ -155,7 +155,7 @@
             <label for="chk-pjoker">Poder do Coringa (Passa a mão no sentido atual):</label>
             <input type="checkbox" id="chk-pjoker" checked />
           </div>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-multijoker">Múltiplos Coringas jogados juntos:</label>
             <select id="sel-multijoker">
               <option value="once" selected>Rodar mãos 1 vez (Padrão)</option>
@@ -166,7 +166,7 @@
             <label for="chk-p48">4 Iguais (1 bar.) / 8 Iguais (2 bar.) inverte ordem:</label>
             <input type="checkbox" id="chk-p48" checked />
           </div>
-          <div class="row">
+          <div class="row row-select">
             <label for="sel-48mode">Contagem de cartas iguais:</label>
             <select id="sel-48mode">
               <option value="sequence" selected>Em sequência no monte</option>
@@ -176,6 +176,10 @@
           <div class="row">
             <label for="chk-48burn">Cartas iguais também limpam o monte:</label>
             <input type="checkbox" id="chk-48burn" />
+          </div>
+          <div class="row">
+            <label for="inp-bigpile">Monte grande (tensão e "organismo vivo") a partir de:</label>
+            <span class="bigpile-input"><input type="number" id="inp-bigpile" min="5" max="99" step="1" value="12" inputmode="numeric" /> cartas</span>
           </div>
           <div id="warn-no-burn" class="rules-warning" style="display:none;">
             ⚠️ Sem o 10 e sem "cartas iguais limpam o monte", nenhuma carta sai do jogo: as partidas podem ficar muito longas.
@@ -222,6 +226,7 @@
         <div id="lbl-Constraint" class="rule-chip">Monte Livre</div>
         <div class="top-actions">
           <button id="btn-turbo" class="btn btn-secondary btn-xs" style="display:none;" title="Acelerar até o fim">⏩</button>
+          <button id="btn-board-game" class="btn btn-secondary btn-xs" title="Placar da sessão">🏆</button>
           <button id="btn-mute-game" class="btn btn-secondary btn-xs" title="Som">🔊</button>
           <button id="btn-leave" class="btn btn-secondary btn-xs">Sair</button>
         </div>
@@ -250,6 +255,11 @@
             </div>
           </div>
           <div id="status-banner" class="status-banner">Preparação</div>
+          <!-- Suas cartas da mesa ficam no feltro, na faixa logo acima da sua área.
+               Quando a mão ampliada abre por cima dessa faixa, elas passam para dentro dela. -->
+          <div class="my-table-slot" id="my-table-slot">
+            <div class="my-table-row" id="my-table-cards"></div>
+          </div>
         </div>
         <div id="opponents-area" class="seats-layer"></div>
         <div id="reaction-layer" class="reaction-layer"></div>
@@ -268,27 +278,58 @@
         <button class="react-btn" data-emoji="😡">😡</button>
         <button class="react-btn" data-emoji="🔥">🔥</button>
         <button class="react-btn" data-emoji="💩">💩</button>
-        <button class="react-btn gombra-btn" data-emoji="GOMBRA" disabled>GOMBRA!</button>
+        <button class="react-btn gombra-btn" data-emoji="GOMBRA" disabled>GOMBRA!<span class="gcount"></span></button>
         <button class="react-btn dormiu-btn" data-emoji="DORMIU" disabled>DORMIU??</button>
       </div>
 
       <!-- Zona do Jogador Local -->
       <div class="player-zone" id="player-zone">
+        <!-- Cabeçalho com nome: só aparece para quem está assistindo -->
         <div class="player-zone-header">
           <div class="me-id">
-            <img id="img-game-my-avatar" class="avatar-sm" alt="Você" />
             <strong id="lbl-my-name-game">Você</strong>
-            <span id="lbl-my-score" class="skull-badge"></span>
           </div>
           <span class="my-hand-badge" id="lbl-my-hand-count">🃏 3</span>
         </div>
-        <div class="my-table-row" id="my-table-cards"></div>
-        <div class="my-hand-scroll" id="my-hand-cards"></div>
+        <!-- Linha compacta: seu avatar + miniatura da mão (toque para ampliar) -->
+        <div class="zone-row">
+          <div class="me-mini">
+            <img id="img-game-my-avatar" class="avatar-sm" alt="Você" />
+            <span id="lbl-my-score" class="skull-badge"></span>
+          </div>
+          <button type="button" class="hand-dock" id="hand-dock" title="Abrir a mão">
+            <span class="dock-fan" id="dock-fan"></span>
+            <span class="dock-label" id="dock-label">Mão</span>
+          </button>
+        </div>
+        <!-- Mão ampliada: camada sobre a mesa (abre na sua vez ou ao tocar na mão) -->
+        <div class="hand-layer" id="hand-layer">
+          <div class="hand-layer-head">
+            <span id="lbl-hand-layer">Sua mão</span>
+            <button type="button" class="btn btn-secondary btn-xs" id="btn-hand-close">▾ Recolher</button>
+          </div>
+          <div class="hand-layer-body">
+            <div class="layer-table-slot" id="layer-table-slot"></div>
+            <div class="my-hand-scroll" id="my-hand-cards"></div>
+          </div>
+        </div>
         <div class="action-bar">
           <button id="btn-ready-swap" class="btn btn-success">Pronto! Iniciar Jogo</button>
           <button id="btn-play-selected" class="btn" style="display:none;">Jogar Carta</button>
           <button id="btn-pickup-pile" class="btn btn-danger" style="display:none;">Pegar Monte</button>
           <button id="btn-turbo-big" class="btn turbo-big" style="display:none;">⏩ Só restam bots — acelerar até o fim</button>
+        </div>
+      </div>
+
+      <!-- Placar da sessão aberto pela mesa (🏆) -->
+      <div id="board-overlay" class="board-overlay">
+        <div class="card-box">
+          <div class="row">
+            <h2>Placar da sessão 🏆</h2>
+            <button id="btn-board-close" class="btn btn-secondary btn-xs">Fechar</button>
+          </div>
+          <div id="board-overlay-list"></div>
+          <span id="lbl-board-overlay-note" class="board-note"></span>
         </div>
       </div>
 

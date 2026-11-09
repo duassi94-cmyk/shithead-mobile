@@ -68,6 +68,9 @@
        ========================================================================== */
     const AppConfig = Object.freeze({
       VERSION: 'shithead-mobile-v5',
+      // Build publicado: data + número da publicação do dia. Atualizar a cada publicação
+      // no GitHub para os logs dizerem exatamente qual código estava rodando.
+      BUILD: '2026-11-09.4',
       MAX_IMAGE_BYTES: 25 * 1024 * 1024, // 25 MB na entrada (fotos de celular passam de 5 MB); vira 96x96
       AVATAR_SIZE: 96,
       ALLOWED_MIMES: ['image/jpeg', 'image/png', 'image/webp'],
@@ -203,9 +206,26 @@
       const STORAGE_KEY = 'sh_last_session_log';
       let sessionData = null;
 
+      // Regras em texto legível (para quem lê o log sem conhecer os nomes internos)
+      function describeRules(r) {
+        if (!r) return [];
+        return [
+          `${r.decks} baralho(s), ${r.pjoker ? r.jokers : 0} coringa(s)`,
+          r.p2 ? `2: joga sobre tudo e joga de novo; se zerar a mão compra ${r.draw2}` : '2: sem poder',
+          r.p7 ? '7: próximo joga ≤ 7' : '7: sem poder',
+          r.p10 ? `10: queima o monte e ${r.after10 === 'again' ? 'joga de novo' : 'passa a vez'}` : '10: sem poder',
+          r.pjoker ? `Coringa: gira as mãos ${r.multijoker === 'per_joker' ? '1 vez por coringa' : '1 vez'}` : 'Coringa: fora do baralho',
+          r.p48 ? `${r.decks === 1 ? 4 : 8} iguais (${r.mode48 === 'together' ? 'juntas' : 'em sequência'}): invertem${r.burn48 ? ' e queimam o monte' : ''}` : 'Iguais: sem poder'
+        ];
+      }
+
+      function buildInfo() {
+        return { appVersion: AppConfig.VERSION, build: AppConfig.BUILD };
+      }
+
       function initNewSession(rules, players) {
         sessionData = {
-          appVersion: AppConfig.VERSION,
+          ...buildInfo(),
           sessionId: 'sess_' + Date.now(),
           createdAt: new Date().toISOString(),
           rulesSnapshot: { ...rules },
@@ -222,6 +242,12 @@
         const matchEntry = {
           matchNumber: sessionData.matches.length + 1,
           startedAt: new Date().toISOString(),
+          // Identificação completa de cada partida: as regras podem mudar entre partidas da mesma sessão
+          ...buildInfo(),
+          rules: { ...rules },
+          rulesText: describeRules(rules),
+          playerCount: players.length,
+          humans: players.filter(p => p.type === 'human').length,
           initialHands: players.map(p => ({
             name: p.name,
             persona: p.persona || 'human',
@@ -265,9 +291,9 @@
         saveToStorage();
       }
 
-      function setMatchMode(mode) {
+      function setMatchMode(mode, extra = {}) {
         const m = currentMatch();
-        if (m) { m.mode = mode; saveToStorage(); }
+        if (m) { Object.assign(m, { mode }, extra); saveToStorage(); }
       }
 
       function logMatchEnd(loserName) {
@@ -318,7 +344,16 @@
         const games = getSavedSession();
         const net = NetLog.get();
         if (!games && net.events.length === 0) return null;
-        return { appVersion: AppConfig.VERSION, exportedAt: new Date().toISOString(), ...(games || {}), network: net };
+        return {
+          appVersion: AppConfig.VERSION,
+          build: AppConfig.BUILD,
+          exportedAt: new Date().toISOString(),
+          exportedFrom: NetLog.environment(),
+          ...(games || {}),
+          // a versão de quem exporta prevalece (o log de partidas pode ser de um build anterior)
+          currentBuild: AppConfig.BUILD,
+          network: net
+        };
       }
 
       function downloadLastSession() {
@@ -381,9 +416,46 @@
         }, 400);
       }
 
+      /* Filtro de privacidade/segurança aplicado a TUDO que entra no log:
+         - remove endereços IP (v4 e v6), URLs, e-mails e sequências longas tipo token/SDP
+         - código de sala aparece mascarado (só os 2 últimos dígitos) para o log
+           compartilhado não servir de convite para uma sala ainda aberta
+         - textos cortados em 120 caracteres, objetos com no máximo 2 níveis */
+      const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+      const IPV6 = /\b(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}\b/gi; // 3+ ":" (não confunde com horário 17:05:53)
+      const URL_RE = /\b(?:https?|wss?|turns?|stuns?):[^\s"']*/gi;
+      const EMAIL = /[^\s@"']+@[^\s@"']+\.[a-z]{2,}/gi;
+      const LONG_TOKEN = /[A-Za-z0-9+/=_-]{28,}/g;
+      function scrubString(s) {
+        return String(s)
+          .replace(URL_RE, '[url]')
+          .replace(EMAIL, '[email]')
+          .replace(IPV4, '[ip]')
+          .replace(IPV6, '[ip]')
+          .replace(LONG_TOKEN, '[token]')
+          .slice(0, 120);
+      }
+      function scrub(v, depth = 0) {
+        if (v == null || typeof v === 'number' || typeof v === 'boolean') return v;
+        if (typeof v === 'string') return scrubString(v);
+        if (depth >= 2 || typeof v !== 'object') return '[obj]';
+        if (Array.isArray(v)) return v.slice(0, 10).map(x => scrub(x, depth + 1));
+        const out = {};
+        Object.keys(v).slice(0, 16).forEach(k => {
+          if (/secret|token|password|senha|sdp|candidate|address|ip$/i.test(k)) return; // nunca grava
+          out[k] = scrub(v[k], depth + 1);
+        });
+        return out;
+      }
+      function maskRoom(r) {
+        return r ? '**' + String(r).slice(-2) : r;
+      }
+
       function log(ev, details = {}) {
         if (!data) load();
-        data.events.push({ t: new Date().toISOString(), s: Math.round((Date.now() - pageStart) / 1000), ev, ...details });
+        const clean = scrub(details);
+        if (clean && clean.room) clean.room = maskRoom(clean.room);
+        data.events.push({ t: new Date().toISOString(), s: Math.round((Date.now() - pageStart) / 1000), ev: String(ev).slice(0, 40), ...clean });
         if (data.events.length > MAX_EVENTS) data.events.splice(0, data.events.length - MAX_EVENTS);
         save();
       }

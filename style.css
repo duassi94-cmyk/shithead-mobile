@@ -903,15 +903,27 @@
       left: 50%;
       top: 45%;
       transform: translate(-50%, -50%);
-      font-size: 2.6rem;
+      font-size: 2.3rem;
       font-weight: 900;
-      color: #fde68a;
-      -webkit-text-stroke: 2px #7c2d12;
-      text-shadow: 0 6px 0 #7c2d12, 0 10px 24px rgba(0,0,0,0.6);
+      line-height: 1.05;
+      letter-spacing: 0.5px;
+      color: #fff7d6;
+      /* Selo laranja + contorno feito com sombras: o -webkit-text-stroke
+         desenhava linhas por dentro das letras no Firefox (Android) */
+      background: linear-gradient(135deg, #f59e0b, #ea580c 60%, #c2410c);
+      border: 3px solid #fde68a;
+      border-radius: 18px;
+      padding: 8px 18px 6px;
+      box-shadow: 0 8px 0 #7c2d12, 0 14px 30px rgba(0,0,0,0.6);
+      text-shadow:
+        -2px -2px 0 #7c2d12, 2px -2px 0 #7c2d12, -2px 2px 0 #7c2d12, 2px 2px 0 #7c2d12,
+        0 -2px 0 #7c2d12, 0 2px 0 #7c2d12, -2px 0 0 #7c2d12, 2px 0 0 #7c2d12,
+        0 4px 0 #7c2d12;
       white-space: nowrap;
+      z-index: 36;
       animation: gombra 1.8s cubic-bezier(0.2, 1.4, 0.4, 1) forwards;
     }
-    .gombra-burst small { display: block; font-size: 0.8rem; -webkit-text-stroke: 0; text-shadow: 0 1px 2px #000; color: #fff; text-align: center; }
+    .gombra-burst small { display: block; font-size: 0.75rem; font-weight: 800; letter-spacing: 0; text-shadow: 0 1px 2px rgba(0,0,0,0.6); color: #fff; text-align: center; margin-top: 2px; }
     @keyframes gombra {
       0% { opacity: 0; transform: translate(-50%, -50%) scale(0.2) rotate(-12deg); }
       25% { opacity: 1; transform: translate(-50%, -50%) scale(1.15) rotate(4deg); }

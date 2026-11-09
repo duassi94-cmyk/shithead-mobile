@@ -25,6 +25,171 @@
     let speedLock = false;
     let toastTimer = null;
 
+    /* ==========================================================================
+       SEGURANÇA: tudo que vem da rede (nomes, fotos, cartas, estado da mesa) é
+       limpo antes de ser usado. Nada recebido de outro aparelho vira código na
+       página: nomes perdem caracteres de HTML, fotos só são aceitas como imagem
+       JPEG/PNG/WebP em base64 e cartas são reconstruídas a partir da lista oficial.
+       ========================================================================== */
+    const HTML_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' };
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"'`]/g, ch => HTML_ESC[ch]);
+    }
+
+    // Caracteres de controle e invisíveis (montado por código: escrever \u2028 direto quebraria a regex)
+    const INVISIBLE_CHARS_RE = new RegExp('[' + [[0x00, 0x1f], [0x7f, 0x9f], [0x200b, 0x200f], [0x2028, 0x202e], [0x2066, 0x2069]]
+      .map(([a, b]) => '\\u' + a.toString(16).padStart(4, '0') + '-\\u' + b.toString(16).padStart(4, '0')).join('') + ']', 'g');
+
+    function sanitizeName(s, fallback = 'Jogador') {
+      const clean = String(s == null ? '' : s)
+        .replace(INVISIBLE_CHARS_RE, '') // caracteres de controle / texto invisível
+        .replace(/[<>&"'`\\]/g, '')
+        .trim()
+        .slice(0, 24); // o campo de nome aceita 14; nomes de bot chegam a ~20
+      return clean || fallback;
+    }
+
+    const AVATAR_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
+    function sanitizeAvatar(s, type = 'human', persona = null) {
+      if (typeof s === 'string' && s.length < 60000 && AVATAR_RE.test(s)) return s;
+      // Os avatares padrão (SVG) são gerados aqui mesmo: nunca aceitos "como vieram"
+      return AvatarModule.getDefaultAvatar(type === 'bot' ? 'bot' : 'human', persona);
+    }
+
+    const SAFE_ID_RE = /^[A-Za-z0-9_-]{1,48}$/;
+    const sanitizeId = (id) => (typeof id === 'string' && SAFE_ID_RE.test(id) ? id : null);
+    const PERSONAS_OK = ['easy', 'medium', 'hard'];
+
+    const RANK_BY_LABEL = {};
+    AppConfig.RANKS.forEach(r => { RANK_BY_LABEL[r.label] = r; });
+    function sanitizeCard(c) {
+      if (!c || typeof c !== 'object') return null;
+      const id = typeof c.id === 'string' && /^[cj]_\d{1,4}$|^tst\d$/.test(c.id) ? c.id : null;
+      if (!id) return null;
+      if (c.isJoker || c.label === 'JOKER') {
+        return { id, label: 'JOKER', val: 16, suit: '★', isRed: false, isJoker: true, public: !!c.public };
+      }
+      const rank = RANK_BY_LABEL[c.label];
+      const suit = AppConfig.SUITS.includes(c.suit) ? c.suit : null;
+      if (!rank || !suit) return null;
+      return { id, label: rank.label, val: rank.val, suit, isRed: suit === '♥' || suit === '♦', isJoker: false, public: !!c.public };
+    }
+    const sanitizeCards = (arr) => (Array.isArray(arr) ? arr.slice(0, 120).map(sanitizeCard).filter(Boolean) : []);
+
+    function sanitizeSlot(s) {
+      if (!s || typeof s !== 'object') return null;
+      const id = sanitizeId(s.id);
+      if (!id) return null;
+      const type = s.type === 'bot' ? 'bot' : 'human';
+      const persona = PERSONAS_OK.includes(s.persona) ? s.persona : null;
+      return { id, name: sanitizeName(s.name), type, persona, avatar: sanitizeAvatar(s.avatar, type, persona) };
+    }
+
+    // Estado da mesa recebido do host: reconstruído campo a campo
+    function sanitizeState(st) {
+      if (!st || typeof st !== 'object' || !Array.isArray(st.players)) return null;
+      const players = st.players.slice(0, 6).map(p => {
+        const id = sanitizeId(p && p.id);
+        if (!id) return null;
+        return {
+          id,
+          name: sanitizeName(p.name),
+          type: p.type === 'bot' ? 'bot' : 'human',
+          persona: PERSONAS_OK.includes(p.persona) ? p.persona : null,
+          hand: sanitizeCards(p.hand),
+          open: sanitizeCards(p.open),
+          closed: sanitizeCards(p.closed),
+          readySwap: !!p.readySwap,
+          escaped: !!p.escaped,
+          disconnected: !!p.disconnected,
+          seatNumber: Number(p.seatNumber) || 0,
+          avatar: null
+        };
+      });
+      if (players.some(p => !p) || players.length < 2) return null;
+      const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+      const ids = players.map(p => p.id);
+      const pid = (v) => (ids.includes(v) ? v : null);
+      return {
+        rules: sanitizeRules(st.rules),
+        deck: sanitizeCards(st.deck),
+        discard: sanitizeCards(st.discard),
+        discardPlayGroups: Array.isArray(st.discardPlayGroups)
+          ? st.discardPlayGroups.slice(-60).map(g => ({ playerName: sanitizeName(g && g.playerName, ''), cards: sanitizeCards(g && g.cards) }))
+          : [],
+        burnedCount: num(st.burnedCount),
+        players,
+        phase: ['SWAP', 'SPEED_TIE', 'PLAY', 'GAMEOVER', 'ABANDONED'].includes(st.phase) ? st.phase : 'PLAY',
+        turnIdx: Math.min(players.length - 1, Math.max(0, num(st.turnIdx))),
+        direction: st.direction === -1 ? -1 : 1,
+        constraint7: !!st.constraint7,
+        freePlayAfterJoker: !!st.freePlayAfterJoker,
+        freePlayAfter2: !!st.freePlayAfter2,
+        bannerText: String(st.bannerText || '').slice(0, 200),
+        tieContext: st.tieContext && Array.isArray(st.tieContext.candidates) ? {
+          role: st.tieContext.role === 'SECOND' ? 'SECOND' : 'FIRST',
+          candidates: st.tieContext.candidates.map(n => num(n, -1)).filter(n => n >= 0 && n < players.length),
+          cardVal: num(st.tieContext.cardVal),
+          label: (RANK_BY_LABEL[st.tieContext.label] ? st.tieContext.label : 'Coringa'),
+          fixedFirstIdx: st.tieContext.fixedFirstIdx == null ? null : num(st.tieContext.fixedFirstIdx)
+        } : null,
+        loserName: st.loserName ? sanitizeName(st.loserName) : null,
+        loserId: pid(st.loserId),
+        loserAvatar: null,
+        mode: ['normal', 'sim', 'tutorial'].includes(st.mode) ? st.mode : 'normal',
+        escapeOrder: Array.isArray(st.escapeOrder) ? st.escapeOrder.map(pid).filter(Boolean) : [],
+        sessionLosses: (() => {
+          const out = {};
+          if (st.sessionLosses && typeof st.sessionLosses === 'object') ids.forEach(id => { out[id] = Math.max(0, num(st.sessionLosses[id])); });
+          return out;
+        })(),
+        version: num(st.version),
+        turnCounter: num(st.turnCounter),
+        pickupStamp: num(st.pickupStamp),
+        lastPickupBy: pid(st.lastPickupBy),
+        stall: null
+      };
+    }
+
+    function sanitizeRules(r) {
+      r = r && typeof r === 'object' ? r : {};
+      const b = (v, d) => (typeof v === 'boolean' ? v : d);
+      return {
+        decks: r.decks === 2 ? 2 : 1,
+        jokers: Math.min(4, Math.max(0, Number(r.jokers) || 0)),
+        p2: b(r.p2, true),
+        draw2: r.draw2 === 3 ? 3 : 1,
+        p7: b(r.p7, true),
+        p10: b(r.p10, true),
+        after10: r.after10 === 'again' ? 'again' : 'next',
+        pjoker: b(r.pjoker, true),
+        multijoker: r.multijoker === 'per_joker' ? 'per_joker' : 'once',
+        p48: b(r.p48, true),
+        mode48: r.mode48 === 'together' ? 'together' : 'sequence',
+        burn48: b(r.burn48, false)
+      };
+    }
+
+    // Registros de partida (placar) recebidos do host
+    function sanitizeRecord(r) {
+      if (!r || typeof r !== 'object' || !Array.isArray(r.players)) return null;
+      const n = Math.min(6, Math.max(2, Number(r.n) || r.players.length));
+      return {
+        matchId: String(r.matchId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64),
+        at: String(r.at || '').slice(0, 30),
+        room: /^\d{4}$/.test(String(r.room)) ? String(r.room) : null,
+        n,
+        players: r.players.slice(0, 6).map(p => ({
+          id: sanitizeId(p && p.id) || 'desconhecido',
+          name: sanitizeName(p && p.name),
+          human: !!(p && p.human),
+          place: Math.min(n, Math.max(1, Number(p && p.place) || n))
+        }))
+      };
+    }
+
+    const REACTIONS_OK = ['👍', '😂', '😱', '😡', '🔥', '💩', 'GOMBRA', 'DORMIU'];
+
     function showInvalidWarning(msg, elementToShake = null) {
       SoundEngine.invalidError();
       const toast = document.getElementById('toast-warning');
@@ -241,7 +406,7 @@
       if (emoji === 'GOMBRA') {
         const burst = document.createElement('div');
         burst.className = 'gombra-burst';
-        burst.innerHTML = `GOMBRA!<small>${p ? p.name : ''}</small>`;
+        burst.innerHTML = `GOMBRA!<small>${p ? esc(p.name) : ''}</small>`;
         layer.appendChild(burst);
         SoundEngine.gombra();
         setTimeout(() => burst.remove(), 1900);
@@ -262,7 +427,7 @@
         burst.className = 'dormiu-burst' + (isMe ? ' dormiu-me' : '');
         burst.style.left = `${tx}px`;
         burst.style.top = `${ty}px`;
-        burst.innerHTML = `💤 DORMIU?? ⏰<small>${p ? p.name : ''}${t && !isMe ? ' → ' + t.name : ''}</small>`;
+        burst.innerHTML = `💤 DORMIU?? ⏰<small>${p ? esc(p.name) : ''}${t && !isMe ? ' → ' + esc(t.name) : ''}</small>`;
         layer.appendChild(burst);
         setTimeout(() => burst.remove(), isMe ? 2600 : 1800);
         if (isMe) {
@@ -412,8 +577,9 @@
       SoundEngine.updateMuteButtons();
       const savedName = Store.get('sh_player_name');
       if (savedName) {
-        document.getElementById('inp-name').value = savedName;
-        lobbySlots[0].name = savedName;
+        const clean = sanitizeName(savedName);
+        document.getElementById('inp-name').value = clean;
+        lobbySlots[0].name = clean;
       }
       syncMyAvatarPreview();
 
@@ -565,7 +731,7 @@
         <tbody>${rows.map((s, i) => `
           <tr class="${s.id === me ? 'b-me' : ''}">
             <td class="b-rank">${i + 1}</td>
-            <td class="b-name"><img class="avatar-sm b-av" src="${avatarForId(s.id)}" alt="" /><span>${s.name}${s.id === me ? ' <em>(você)</em>' : ''}</span></td>
+            <td class="b-name"><img class="avatar-sm b-av" src="${esc(avatarForId(s.id))}" alt="" /><span>${esc(s.name)}${s.id === me ? ' <em>(você)</em>' : ''}</span></td>
             <td>${s.played}</td>
             <td class="b-loss">${s.losses}</td>
             <td>${Math.round((s.losses / s.played) * 100)}%</td>
@@ -633,8 +799,8 @@
           div.innerHTML = `
             <div class="slot-left">
               <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
-              <img src="${avatarSrc}" class="avatar-sm" alt="${slot.name}" />
-              <strong>${slot.name}${slot.id === myPlayerId ? ' <span style="color:var(--cyan);font-weight:600;">(você)</span>' : ''}</strong>
+              <img src="${esc(avatarSrc)}" class="avatar-sm" alt="" />
+              <strong>${esc(slot.name)}${slot.id === myPlayerId ? ' <span style="color:var(--cyan);font-weight:600;">(você)</span>' : ''}</strong>
             </div>
             <div style="display:flex; gap:6px; align-items:center;">
               ${idx === 0 ? '<span class="badge">Host</span>' : (isHost
@@ -647,8 +813,8 @@
           div.innerHTML = `
             <div class="slot-left">
               <span class="badge" style="background:#0f172a; color:var(--cyan);">#${idx + 1}</span>
-              <img src="${avatarSrc}" class="avatar-sm" alt="${slot.name}" />
-              <strong>${slot.name}</strong>
+              <img src="${esc(avatarSrc)}" class="avatar-sm" alt="" />
+              <strong>${esc(slot.name)}</strong>
             </div>
             <div style="display:flex; gap:6px; align-items:center;">
               ${isHost ? `
@@ -847,8 +1013,18 @@
       if (!msg || typeof msg !== 'object') return;
       NetLog.count('msg_in');
       if (msg.type === 'CHUNK') {
+        // Limites: até 100 pedaços por mensagem (~1,2 MB), 8 mensagens em montagem por conexão
+        const n = Number(msg.n);
+        const i = Number(msg.i);
+        if (!Number.isInteger(n) || n < 1 || n > 100 || !Number.isInteger(i) || i < 0 || i >= n ||
+            typeof msg.part !== 'string' || msg.part.length > NET_CHUNK || typeof msg.id !== 'string' || msg.id.length > 40) {
+          NetLog.count('chunk_rejected');
+          return;
+        }
         const buf = conn.__chunks || (conn.__chunks = {});
-        const entry = buf[msg.id] || (buf[msg.id] = { parts: new Array(msg.n), got: 0, at: Date.now() });
+        if (!buf[msg.id] && Object.keys(buf).length >= 8) { NetLog.count('chunk_rejected'); return; }
+        const entry = buf[msg.id] || (buf[msg.id] = { parts: new Array(n), got: 0, at: Date.now() });
+        if (entry.parts.length !== n) { NetLog.count('chunk_rejected'); return; }
         if (entry.parts[msg.i] === undefined) { entry.parts[msg.i] = msg.part; entry.got++; }
         if (entry.got === msg.n) {
           delete buf[msg.id];
@@ -1076,6 +1252,18 @@
       return id;
     }
 
+    // Segredo do aparelho: só vai para o host da sala, nunca é repassado aos outros jogadores
+    function getDeviceSecret() {
+      let s = Store.get('sh_device_secret');
+      if (!s || !/^[A-Za-z0-9]{16,64}$/.test(s)) {
+        const bytes = new Uint8Array(16);
+        (window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.forEach((_, i) => { bytes[i] = Math.random() * 256; });
+        s = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        Store.set('sh_device_secret', s);
+      }
+      return s;
+    }
+
     function handleClientLeft(conn) {
       const idx = clientConns.indexOf(conn);
       if (idx === -1) return;
@@ -1162,7 +1350,7 @@
           watchPeerConnection(conn, 'host');
           const myName = document.getElementById('inp-name').value.trim() || 'Jogador';
           const avatar = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
-          netSend(conn, { type: 'JOIN', id: myPlayerId, name: myName, avatar, env: NetLog.environment() });
+          netSend(conn, { type: 'JOIN', id: myPlayerId, secret: getDeviceSecret(), name: myName, avatar, env: NetLog.environment() });
           // Conta ao host por que precisou reconectar (fica no log dos dois lados)
           if (joinAttempts > 1) netSend(conn, { type: 'NETLOG', what: 'reconnected', info: { attempt: joinAttempts, lastReason: lastLostReason } });
           lastLostReason = null;
@@ -1266,13 +1454,45 @@
       }
     });
 
+    // Segredo de cada aparelho (memória do host): impede que alguém use o id de
+    // outra pessoa — os ids aparecem na lista do lobby, o segredo nunca é repassado.
+    const guestSecrets = {};
+    const GUEST_ID_RE = /^(dev|peer)_[A-Za-z0-9]{4,24}$/;
+
+    function sanitizeEnv(e) {
+      if (!e || typeof e !== 'object') return null;
+      const s = (v, n = 24) => (v == null ? null : String(v).replace(/[^\w .()-]/g, '').slice(0, n));
+      const num = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v) * 10) / 10 : null);
+      return { browser: s(e.browser), os: s(e.os), mobile: !!e.mobile, online: !!e.online, netType: s(e.netType, 8),
+        downlinkMbps: num(e.downlinkMbps), rttMs: num(e.rttMs), saveData: !!e.saveData, standalone: !!e.standalone, webrtc: !!e.webrtc };
+    }
+
     function handleHostReceive(conn, data) {
       if (!data || typeof data !== 'object') return;
+      // Antes do JOIN aceito, a conexão só pode mandar JOIN
+      if (!conn.__playerId && data.type !== 'JOIN') return;
       if (data.type === 'JOIN') {
+        const id = typeof data.id === 'string' && GUEST_ID_RE.test(data.id) ? data.id : null;
+        const secret = typeof data.secret === 'string' && /^[A-Za-z0-9]{16,64}$/.test(data.secret) ? data.secret : null;
+        if (!id || !secret) {
+          nlog('join_rejected', { reason: 'id_ou_segredo_invalido' });
+          NetLog.count('join_rejected');
+          try { conn.close(); } catch (e) {}
+          return;
+        }
+        if (guestSecrets[id] && guestSecrets[id] !== secret) {
+          // Alguém tentando entrar com o id de outro aparelho
+          nlog('join_rejected', { reason: 'segredo_diferente', pid: shortId(id) });
+          NetLog.count('join_rejected');
+          try { conn.close(); } catch (e) {}
+          return;
+        }
+        guestSecrets[id] = secret;
+        data.id = id;
         conn.__playerId = data.id;
         conn.__openedAt = conn.__openedAt || Date.now();
         const rejoin = lobbySlots.some(s => s.id === data.id) || !!(G && G.players && G.players.some(p => p.id === data.id));
-        nlog('guest_join', { pid: shortId(data.id), name: String(data.name || '').slice(0, 14), rejoin, inGame: hostInGame(), env: data.env || null });
+        nlog('guest_join', { pid: shortId(data.id), name: sanitizeName(data.name), rejoin, inGame: hostInGame(), env: sanitizeEnv(data.env) });
         NetLog.count(rejoin ? 'guest_rejoin' : 'guest_join');
         // Mesmo aparelho reconectando: fecha a conexão antiga (sem tratar como saída)
         clientConns.forEach(c => {
@@ -1284,8 +1504,8 @@
         for (let i = clientConns.length - 1; i >= 0; i--) {
           if (clientConns[i].__replaced) clientConns.splice(i, 1);
         }
-        const name = String(data.name || 'Jogador').slice(0, 14);
-        const avatar = typeof data.avatar === 'string' && data.avatar.length < 60000 ? data.avatar : AvatarModule.getDefaultAvatar('human', null);
+        const name = sanitizeName(data.name);
+        const avatar = sanitizeAvatar(data.avatar);
 
         // Voltando para uma partida em andamento: devolve o lugar
         const gp = G && G.phase !== 'ABANDONED' ? G.players.find(p => p.id === data.id) : null;
@@ -1328,14 +1548,21 @@
       } else if (data.type === 'PROFILE') {
         const slot = lobbySlots.find(s => s.id === conn.__playerId);
         if (slot) {
-          slot.name = String(data.name || slot.name).slice(0, 14);
-          if (typeof data.avatar === 'string' && data.avatar.length < 60000) slot.avatar = data.avatar;
+          slot.name = sanitizeName(data.name, slot.name);
+          if (data.avatar) slot.avatar = sanitizeAvatar(data.avatar);
           renderLobbySlots();
           broadcastLobby();
         }
       } else if (data.type === 'NETLOG') {
-        // Convidado avisando de um problema que ele viu (ex.: reconectou)
-        nlog('guest_report', { pid: shortId(conn.__playerId), what: String(data.what || '').slice(0, 40), info: data.info || null });
+        // Convidado avisando de um problema que ele viu (ex.: reconectou).
+        // Só campos conhecidos e curtos entram no log do host.
+        const info = data.info && typeof data.info === 'object' ? data.info : {};
+        nlog('guest_report', {
+          pid: shortId(conn.__playerId),
+          what: String(data.what || '').replace(/[^\w-]/g, '').slice(0, 30),
+          attempt: Math.min(999, Math.max(0, Number(info.attempt) || 0)),
+          lastReason: info.lastReason ? String(info.lastReason).replace(/[^\w-]/g, '').slice(0, 30) : null
+        });
       } else if (data.type === 'RESYNC') {
         nlog('resync_request', { pid: shortId(conn.__playerId) });
         NetLog.count('resync_request');
@@ -1343,10 +1570,25 @@
         if (hostInGame()) netSend(conn, { type: 'STATE_SYNC', state: stateForNet(), fx: null });
         else netSend(conn, { type: 'LOBBY_SYNC', slots: lobbySlots });
       } else if (data.type === 'ACTION') {
-        // Só aceita ações do próprio jogador daquela conexão
-        if (conn.__playerId && data.playerId === conn.__playerId) executePlayerAction(data.playerId, data.action);
+        // Só aceita ações do próprio jogador daquela conexão, com formato conhecido
+        if (!conn.__playerId || data.playerId !== conn.__playerId) return;
+        const a = data.action;
+        if (!a || typeof a !== 'object') return;
+        const idList = (v) => (Array.isArray(v) ? v.filter(x => typeof x === 'string').slice(0, 12) : []);
+        const types = ['PLAY_CARDS', 'PICKUP_PILE', 'PLAY_BLIND', 'SWAP_CARDS', 'READY_SWAP', 'SPEED_TAP'];
+        if (!types.includes(a.type)) return;
+        executePlayerAction(conn.__playerId, {
+          type: a.type,
+          handIds: idList(a.handIds),
+          openIds: idList(a.openIds),
+          cardId: typeof a.cardId === 'string' ? a.cardId : null,
+          handId: typeof a.handId === 'string' ? a.handId : null,
+          openId: typeof a.openId === 'string' ? a.openId : null
+          // fromRect (posição na tela de quem jogou) é descartado: não vale em outro aparelho
+        });
       } else if (data.type === 'REACTION') {
-        if (data.playerId !== conn.__playerId) return;
+        if (data.playerId !== conn.__playerId || !REACTIONS_OK.includes(data.emoji)) return;
+        data.target = sanitizeId(data.target);
         // O host confere as janelas (com uma folga de 2 s pela rede)
         if (data.emoji === 'GOMBRA') {
           const fresh = pickupSeenAt && Date.now() - pickupSeenAt < GOMBRA_WINDOW_MS + 2000;
@@ -1364,35 +1606,47 @@
     function handleClientReceive(data) {
       if (!data || typeof data !== 'object') return;
       if (data.type === 'LOBBY_SYNC') {
-        lobbySlots = data.slots;
+        if (!Array.isArray(data.slots)) return;
+        const slots = data.slots.slice(0, 6).map(sanitizeSlot).filter(Boolean);
+        if (slots.length) lobbySlots = slots;
         renderLobbySlots();
       } else if (data.type === 'PING') {
-        handlePing(data);
+        handlePing({ inGame: !!data.inGame, version: Number(data.version) || 0 });
       } else if (data.type === 'MATCH_RESULT') {
         // Guarda no histórico deste aparelho as partidas de que participei
-        if (data.record && Array.isArray(data.record.players) && data.record.players.some(p => p.id === getDeviceId())) {
-          addToHistory(data.record);
-        }
-        if (Array.isArray(data.session)) sessionRecords = data.session;
+        const rec = sanitizeRecord(data.record);
+        if (rec && rec.matchId && rec.players.some(p => p.id === getDeviceId())) addToHistory(rec);
+        if (Array.isArray(data.session)) sessionRecords = data.session.slice(-500).map(sanitizeRecord).filter(Boolean);
         renderScoreboard();
         if (G) renderGame();
       } else if (data.type === 'SESSION') {
-        if (Array.isArray(data.session)) sessionRecords = data.session;
+        if (Array.isArray(data.session)) sessionRecords = data.session.slice(-500).map(sanitizeRecord).filter(Boolean);
         renderScoreboard();
       } else if (data.type === 'STATE_SYNC') {
-        if (!data.state) return;
-        restoreAvatars(data.state);
-        G = data.state;
+        const state = sanitizeState(data.state);
+        if (!state) { NetLog.count('state_rejected'); return; }
+        restoreAvatars(state);
+        G = state;
         lastHostPingAt = Date.now();
         document.getElementById('screen-lobby').classList.remove('active');
         document.getElementById('screen-game').classList.add('active');
         keepScreenAwake(G.phase !== 'GAMEOVER');
-        if (data.fx) {
-          triggerFlightVisual({ ...data.fx, isMe: data.fx.actorId === myPlayerId });
+        if (data.fx && typeof data.fx === 'object') {
+          const kinds = ['PLAY', 'PICKUP', 'DRAW', 'SLIDE_INIT', 'SWAP'];
+          const fx = {
+            kind: kinds.includes(data.fx.kind) ? data.fx.kind : null,
+            actorId: sanitizeId(data.fx.actorId),
+            cards: sanitizeCards(data.fx.cards),
+            count: Math.min(60, Math.max(0, Number(data.fx.count) || 0)),
+            sfxTag: typeof data.fx.sfxTag === 'string' ? data.fx.sfxTag.slice(0, 12) : null,
+            burned: !!data.fx.burned
+          };
+          if (fx.kind) triggerFlightVisual({ ...fx, isMe: fx.actorId === myPlayerId });
         }
         renderGame();
       } else if (data.type === 'REACTION') {
-        showReaction(data.playerId, data.emoji, data.target || null);
+        if (!REACTIONS_OK.includes(data.emoji)) return;
+        showReaction(sanitizeId(data.playerId), data.emoji, sanitizeId(data.target));
       } else if (data.type === 'KICKED') {
         nlog('kicked');
         joinRoomCode = '';
@@ -1533,7 +1787,7 @@
         LoggerModule.initNewSession(rules, players);
       }
       LoggerModule.startMatchLog(rules, players);
-      LoggerModule.setMatchMode(currentMode);
+      LoggerModule.setMatchMode(currentMode, { online: clientConns.length > 0, guestsConnected: clientConns.length });
 
       G = {
         rules,
@@ -2391,7 +2645,7 @@
         node.className = 'seq-node' + (isCurrent ? ' seq-active' : '') + (isNext ? ' seq-next' : '') + (p.escaped ? ' seq-escaped' : '');
         const avatarSrc = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
         const tag = isCurrent ? ' · VEZ' : (isNext ? ' · PRÓX' : '');
-        node.innerHTML = `<img src="${avatarSrc}" alt="" /><span>${idx === meIdx && G.mode !== 'sim' ? 'Você' : p.name.split(' ')[0]}${tag}</span>`;
+        node.innerHTML = `<img src="${esc(avatarSrc)}" alt="" /><span>${idx === meIdx && G.mode !== 'sim' ? 'Você' : esc(p.name.split(' ')[0])}${tag}</span>`;
         seqBar.appendChild(node);
         if (k < n - 1) {
           const arrow = document.createElement('span');
@@ -2446,11 +2700,11 @@
         const avatarSrc = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
         seat.innerHTML = `
           <div class="seat-avatar-wrap">
-            <img class="seat-avatar" src="${avatarSrc}" alt="" />
+            <img class="seat-avatar" src="${esc(avatarSrc)}" alt="" />
             <span class="skull-badge">${scoreFor(p)}</span>
             <span class="seat-hand-pill" title="Cartas na mão">${p.hand.length}</span>
           </div>
-          <div class="seat-name">${p.name}</div>
+          <div class="seat-name">${esc(p.name)}</div>
           <div class="opp-mini-table">${miniTable}</div>
           <div class="seat-status">${status}</div>`;
         oppArea.appendChild(seat);
@@ -2725,7 +2979,7 @@
           if (!p) return '';
           const icon = id === G.loserId ? '💩' : (medals[i] || `${i + 1}º`);
           const av = p.avatar || AvatarModule.getDefaultAvatar(p.type, p.persona);
-          return `<div class="podium-item${id === G.loserId ? ' podium-loser' : ''}"><span class="podium-icon">${icon}</span><img class="avatar-sm" src="${av}" alt="" /><span class="podium-name">${p.name}</span></div>`;
+          return `<div class="podium-item${id === G.loserId ? ' podium-loser' : ''}"><span class="podium-icon">${icon}</span><img class="avatar-sm" src="${esc(av)}" alt="" /><span class="podium-name">${esc(p.name)}</span></div>`;
         }).join('');
         document.getElementById('gameover-scores').innerHTML =
           `<div class="podium">${podium}</div>` +
@@ -2962,7 +3216,7 @@
     document.getElementById('inp-file-gallery').addEventListener('change', handleAvatarInput);
 
     document.getElementById('inp-name').addEventListener('input', (e) => {
-      const val = e.target.value.trim() || 'Jogador';
+      const val = sanitizeName(e.target.value);
       Store.set('sh_player_name', val);
       if (isHost) {
         lobbySlots[0].name = val;
@@ -3126,7 +3380,12 @@
     document.getElementById('btn-leave').addEventListener('click', returnToLobbyScreen);
     document.getElementById('btn-play-again').addEventListener('click', returnToLobbyScreen);
 
-    NetLog.log('app_start', { version: AppConfig.VERSION, device: getDeviceId().slice(-6), viaInvite: /[?&]sala=\d{4}/.test(location.search) });
+    NetLog.log('app_start', { version: AppConfig.VERSION, build: AppConfig.BUILD, device: getDeviceId().slice(-6), viaInvite: /[?&]sala=\d{4}/.test(location.search) });
+    // Mostra a versão/build no topo do lobby (ajuda a saber qual versão o celular está rodando)
+    (() => {
+      const p = document.querySelector('.brand-title-wrap p');
+      if (p) p.textContent = `${AppConfig.VERSION} · build ${AppConfig.BUILD} · P2P Mobile & Desktop`;
+    })();
     // Mantém o resumo do log atualizado enquanto o lobby está aberto
     setInterval(() => {
       if (document.getElementById('screen-lobby').classList.contains('active')) refreshLogPanelUI();

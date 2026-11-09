@@ -147,6 +147,7 @@
         turnCounter: num(st.turnCounter),
         pickupStamp: num(st.pickupStamp),
         lastPickupBy: pid(st.lastPickupBy),
+        turbo: !!st.turbo,
         stall: null
       };
     }
@@ -281,7 +282,7 @@
 
     function triggerFlightVisual(fx) {
       if (!fx) return;
-      if (turboMode) return; // acelerado: sem animações nem sons por jogada
+      if (turboMode || (G && G.turbo)) return; // acelerado: sem animações nem sons por jogada
       if (fx.sfxTag) SoundEngine.playByTag(fx.sfxTag);
 
       const discardEl = document.getElementById('discard-pile-visual');
@@ -1347,6 +1348,7 @@
           clearTimeout(timeout);
           conn.__openedAt = Date.now();
           nlog('conn_open', { ms: Date.now() - t0, attempt: joinAttempts });
+          retryCount = 0;
           watchPeerConnection(conn, 'host');
           const myName = document.getElementById('inp-name').value.trim() || 'Jogador';
           const avatar = myCustomAvatar || AvatarModule.getDefaultAvatar('human', null);
@@ -1374,9 +1376,26 @@
         nlog('peer_error', errInfo(err));
         NetLog.count('peer_error_' + (err && err.type));
         setNetStatus('join-net-status', peerErrorText(err), 'error');
-        if (err.type === 'peer-unavailable') setGuestLobbyMode(false);
+        if (err.type === 'peer-unavailable') { setGuestLobbyMode(false); return; }
+        // Falha de rede/servidor (comum ao voltar da tela apagada): tenta de novo com
+        // intervalos crescentes (3 s, 6 s, 12 s… até 30 s). Com a tela apagada, espera
+        // ela voltar — o aviso de "tela visível" reconecta na hora.
+        const transient = ['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected'].includes(err.type);
+        if (transient && joinRoomCode && peer === myPeer) {
+          retryCount = Math.min(retryCount + 1, 6);
+          const wait = Math.min(30000, 3000 * Math.pow(2, retryCount - 1));
+          lastLostReason = 'erro_' + err.type;
+          if (!document.hidden) {
+            clearTimeout(reconnectTimer);
+            setNetStatus('join-net-status', `Sem conexão com o servidor. Tentando de novo em ${Math.round(wait / 1000)} s...`, 'warn');
+            nlog('retry_scheduled', { inS: Math.round(wait / 1000), retry: retryCount });
+            reconnectTimer = setTimeout(() => { if (joinRoomCode && !(hostConn && hostConn.open)) joinRoom(joinRoomCode); }, wait);
+          }
+        }
       });
     }
+
+    let retryCount = 0;
 
     // Celular voltou do modo de espera: se a conexão caiu, reconecta na hora
     document.addEventListener('visibilitychange', () => {
@@ -1515,6 +1534,8 @@
           gp.disconnected = false;
           gp.name = name;
           G.bannerText = `${name} voltou para a mesa!`;
+          // Um humano voltou com cartas: sai do modo acelerado
+          if (!gp.escaped) { turboMode = false; G.turbo = false; }
           clearTimeout(aiTimeout);
           broadcastState();
           renderGame();
@@ -1563,6 +1584,10 @@
           attempt: Math.min(999, Math.max(0, Number(info.attempt) || 0)),
           lastReason: info.lastReason ? String(info.lastReason).replace(/[^\w-]/g, '').slice(0, 30) : null
         });
+      } else if (data.type === 'TURBO') {
+        // Convidado pediu para acelerar: só vale se não houver mais humanos com cartas
+        const p = G && G.players.find(pl => pl.id === conn.__playerId);
+        activateTurbo(p ? p.name : 'convidado');
       } else if (data.type === 'RESYNC') {
         nlog('resync_request', { pid: shortId(conn.__playerId) });
         NetLog.count('resync_request');
@@ -1946,6 +1971,11 @@
         return false;
       }
 
+      if (openChosen.length > 0 && G.deck.length > 0) {
+        showInvalidWarning('Ainda há cartas no baralho: as cartas da mesa só valem depois que ele acabar!');
+        return false;
+      }
+
       if (handChosen.length > 0 && openChosen.length > 0) {
         if (G.deck.length > 0 || handChosen.length !== me.hand.length) {
           showInvalidWarning('Só é possível combinar cartas da mesa com a última jogada da mão quando o baralho zerar!');
@@ -2103,6 +2133,7 @@
           if (G.deck.length > 0 || handChosen.length !== player.hand.length) return;
         }
         if (handChosen.length === 0 && player.hand.length > 0) return;
+        if (openChosen.length > 0 && G.deck.length > 0) return; // mesa só depois do baralho acabar
 
         const handSnapshot = player.hand.map(c => c.label + c.suit);
         const openSnapshot = player.open.map(c => c.label + c.suit);
@@ -2277,6 +2308,26 @@
       }
     }
 
+    /* Regra: enquanto houver baralho de compra, a mesa (abertas/fechadas) não pode
+       ser jogada. Se a vez começar com a mão abaixo de 3 cartas — o Coringa girou
+       uma mão vazia/pequena, ou uma jogada extra (2, 10 "joga de novo") zerou a mão —
+       o jogador compra antes de jogar:
+       - vez normal: completa até 3 cartas;
+       - jogada extra com a mão vazia: compra a quantidade da regra "se zerar a mão" (1 ou 3). */
+    function refillHandAtTurnStart(samePlayerAgain) {
+      if (!G || G.phase !== 'PLAY' || G.deck.length === 0) return;
+      const p = G.players[G.turnIdx];
+      if (!p || p.escaped) return;
+      const target = samePlayerAgain
+        ? (p.hand.length === 0 ? Math.min(3, G.rules.draw2 || 1) : 0)
+        : 3;
+      const need = Math.min(target - p.hand.length, G.deck.length);
+      if (need <= 0) return;
+      p.hand.push(...G.deck.splice(0, need));
+      LoggerModule.logTurn({ player: p.name, persona: p.persona || 'human', action: 'DRAW_AT_TURN_START', count: need, deckCount: G.deck.length, samePlayerAgain });
+      triggerFlightVisual({ kind: 'DRAW', actorId: p.id, isMe: p.id === myPlayerId, count: need });
+    }
+
     function advanceTurn(samePlayerAgain, fx = null) {
       selectedHandIds.clear();
       selectedOpenIds.clear();
@@ -2284,6 +2335,7 @@
       if (!samePlayerAgain) {
         G.turnIdx = RulesEngine.getNextActivePlayerIndex(G, G.turnIdx);
       }
+      refillHandAtTurnStart(samePlayerAgain);
       updateStallTracker();
 
       broadcastState(fx);
@@ -2846,8 +2898,13 @@
 
       // Botão ⏩: aparece quando você já escapou (ou na simulação)
       const turboBtn = document.getElementById('btn-turbo');
-      const canTurbo = isHost && G.phase === 'PLAY' && (spectator || me.escaped) && !turboMode;
+      // ⏩ liberado na simulação ou quando todos que ainda têm cartas são bots (host ou convidado)
+      const turboOn = turboMode || !!G.turbo;
+      const canTurbo = G.phase === 'PLAY' && !turboOn && ((G.mode === 'sim' && isHost) || onlyBotsLeft());
       turboBtn.style.display = canTurbo ? 'inline-block' : 'none';
+      const bigTurbo = document.getElementById('btn-turbo-big');
+      const showBig = canTurbo && G.mode !== 'sim';
+      bigTurbo.style.display = showBig ? 'block' : 'none';
 
       // Zona do jogador local
       const zone = document.getElementById('player-zone');
@@ -2881,7 +2938,7 @@
           oDom.classList.add('open-over');
           oDom.dataset.cardId = openCard.id;
           if (selectedOpenIds.has(openCard.id)) oDom.classList.add('selected');
-          if (isMyTurn && me.hand.length === 0 && RulesEngine.isCardPlayable(G, openCard)) oDom.classList.add('playable');
+          if (isMyTurn && me.hand.length === 0 && G.deck.length === 0 && RulesEngine.isCardPlayable(G, openCard)) oDom.classList.add('playable');
           if (!spectator) attachCardInteraction(oDom, openCard, 'open', me, isMyTurn);
           stack.appendChild(oDom);
         }
@@ -2911,7 +2968,7 @@
       const btnPlay = document.getElementById('btn-play-selected');
       const btnPickup = document.getElementById('btn-pickup-pile');
       const actionBar = btnReady.parentElement;
-      actionBar.style.display = spectator ? 'none' : 'flex';
+      actionBar.style.display = (spectator && !showBig) ? 'none' : 'flex';
       document.getElementById('reaction-bar').style.display = (spectator || G.mode === 'tutorial') ? 'none' : 'flex';
 
       if (G.phase === 'SWAP') {
@@ -3010,6 +3067,10 @@
     }
 
     function toggleSelectOpenCard(me, card, domEl) {
+      if (G.deck.length > 0) {
+        showInvalidWarning('Ainda há cartas no baralho: as cartas da mesa só valem depois que ele acabar!', domEl);
+        return;
+      }
       if (me.hand.length > 0) {
         if (G.deck.length > 0 || selectedHandIds.size !== me.hand.length) {
           showInvalidWarning('Jogue todas as cartas da mão antes de selecionar as cartas da mesa!', domEl);
@@ -3314,13 +3375,33 @@
 
     document.getElementById('btn-coach-ok').addEventListener('click', closeCoach);
 
-    document.getElementById('btn-turbo').addEventListener('click', () => {
-      if (!G || G.phase !== 'PLAY') return;
+    // Só bots ainda têm cartas (humanos escaparam ou caíram e um bot assumiu)
+    function onlyBotsLeft() {
+      if (!G || G.phase !== 'PLAY') return false;
+      const active = G.players.filter(p => !p.escaped);
+      return active.length > 1 && active.every(p => p.type === 'bot');
+    }
+
+    function activateTurbo(byName) {
+      if (!G || G.phase !== 'PLAY' || turboMode) return;
+      if (G.mode !== 'sim' && !onlyBotsLeft()) return;
       turboMode = true;
-      G.bannerText = '⏩ Acelerando até o fim...';
+      G.turbo = true;
+      G.bannerText = `⏩ Acelerando até o fim${byName ? ' (pedido de ' + byName + ')' : ''}...`;
+      nlog('turbo', { by: byName || 'host' });
+      broadcastState();
       renderGame();
       scheduleBotIfNeeded();
-    });
+    }
+
+    function requestTurbo() {
+      if (!G || G.phase !== 'PLAY') return;
+      if (isHost) activateTurbo(null);
+      else if (hostConn) netSend(hostConn, { type: 'TURBO' });
+    }
+
+    document.getElementById('btn-turbo').addEventListener('click', requestTurbo);
+    document.getElementById('btn-turbo-big').addEventListener('click', requestTurbo);
 
     document.querySelectorAll('.react-btn').forEach(btn => {
       btn.addEventListener('click', () => sendReaction(btn.dataset.emoji));

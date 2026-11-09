@@ -1020,6 +1020,11 @@
 
     .action-bar { display: flex; gap: 8px; justify-content: center; }
     .action-bar .btn { flex: 1; padding: 10px; font-size: 0.86rem; }
+    .action-bar .turbo-big {
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      color: #fff;
+      animation: pulse 0.9s infinite alternate;
+    }
     .spectator-note {
       text-align: center;
       font-size: 0.74rem;

@@ -70,7 +70,7 @@
       VERSION: 'shithead-mobile-v5',
       // Build publicado: data + número da publicação do dia. Atualizar a cada publicação
       // no GitHub para os logs dizerem exatamente qual código estava rodando.
-      BUILD: '2026-11-09.4',
+      BUILD: '2026-11-09.5',
       MAX_IMAGE_BYTES: 25 * 1024 * 1024, // 25 MB na entrada (fotos de celular passam de 5 MB); vira 96x96
       AVATAR_SIZE: 96,
       ALLOWED_MIMES: ['image/jpeg', 'image/png', 'image/webp'],
@@ -1334,8 +1334,16 @@
         s.plies++;
         const active = s.players.filter(p => !p.escaped);
         if (active.length <= 1) { s.over = true; return; }
-        if (!again || s.players[s.turnIdx].escaped) {
+        const sameAgain = again && !s.players[s.turnIdx].escaped;
+        if (!sameAgain) {
           s.turnIdx = RulesEngine.getNextActivePlayerIndex(s, s.turnIdx);
+        }
+        // Mesma regra do jogo: com baralho, a vez começa com a mão completa
+        const p = s.players[s.turnIdx];
+        if (s.deck.length > 0 && p && !p.escaped) {
+          const target = sameAgain ? (p.hand.length === 0 ? Math.min(3, s.rules.draw2 || 1) : 0) : 3;
+          const need = Math.min(target - p.hand.length, s.deck.length);
+          if (need > 0) p.hand.push(...s.deck.splice(0, need));
         }
       }
 

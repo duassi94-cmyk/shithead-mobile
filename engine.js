@@ -70,7 +70,7 @@
       VERSION: 'shithead-mobile-v5',
       // Build publicado: data + número da publicação do dia. Atualizar a cada publicação
       // no GitHub para os logs dizerem exatamente qual código estava rodando.
-      BUILD: '2026-11-09.6',
+      BUILD: '2026-11-09.7',
       MAX_IMAGE_BYTES: 25 * 1024 * 1024, // 25 MB na entrada (fotos de celular passam de 5 MB); vira 96x96
       AVATAR_SIZE: 96,
       ALLOWED_MIMES: ['image/jpeg', 'image/png', 'image/webp'],

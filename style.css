@@ -1430,3 +1430,50 @@
       .slot-left .badge { padding: 2px 6px; }
       .slot-left-bot select { font-size: 0.74rem; padding: 4px 4px; }
     }
+
+    /* ===== Reações na lateral direita: visíveis mesmo com a mão ampliada ===== */
+    .game-body { display: flex; flex: 1 1 auto; min-height: 0; gap: 5px; }
+    .game-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+    .reaction-bar {
+      flex: 0 0 40px;
+      width: 40px;
+      flex-direction: column;
+      flex-wrap: nowrap;
+      justify-content: center;
+      align-items: stretch;
+      gap: 4px;
+      padding: 0;
+    }
+    .reaction-bar .react-btn { width: 40px; padding: 5px 0; font-size: 1.05rem; text-align: center; border-radius: 12px; }
+    /* GOMBRA! e DORMIU?? com texto na vertical, para caber na coluna sem cortar */
+    .reaction-bar .gombra-btn, .reaction-bar .dormiu-btn {
+      writing-mode: vertical-rl;
+      padding: 9px 0;
+      font-size: 0.7rem;
+      letter-spacing: 0.5px;
+      line-height: 1;
+    }
+    .reaction-bar .gombra-btn .gcount { width: auto; inline-size: 2.6ch; text-align: end; }
+
+    /* Mesa mais estreita (a coluna de reações ocupa a direita) */
+    @media (max-width: 420px) {
+      .piles-row { gap: 8px; }
+      .pile-box { width: calc(var(--card-w) + 12px); }
+      .pile-box:nth-child(2) { width: calc(var(--card-w) + 36px); }
+      .pile-label { font-size: 0.6rem; padding: 2px 6px; }
+    }
+    .seats-tight .mini-slot { width: 14px; height: 20px; font-size: 0.52rem; }
+    .seats-tight .seat-avatar { width: 30px; height: 30px; }
+    /* contador da miniatura: coluna centralizada que sempre cabe na sua caixa */
+    .dock-label { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 38px; }
+    @media (max-width: 360px) {
+      .dock-label { width: 3.4em; }
+      .dock-label .dock-turn-txt { display: none; }
+    }
+    /* faixa de ordem em celulares estreitos: cabe com 6 jogadores */
+    @media (max-width: 360px) {
+      .turn-sequence-bar { gap: 2px; }
+      .seq-arrow { font-size: 0.62rem; }
+      .seq-node { font-size: 0.62rem; gap: 3px; }
+      .seq-node img { width: 18px; height: 18px; }
+    }

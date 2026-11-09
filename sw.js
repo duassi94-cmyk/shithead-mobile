@@ -2,7 +2,7 @@
 // Estratégia "rede primeiro": sempre tenta baixar a versão mais nova do GitHub Pages
 // e só usa o cache quando estiver offline. Assim, cada atualização publicada
 // aparece para os jogadores sem precisar limpar o cache do navegador.
-const CACHE_NAME = 'shithead-mobile-v5-b6';
+const CACHE_NAME = 'shithead-mobile-v5-b7';
 const ASSETS = [
   './',
   './index.html',

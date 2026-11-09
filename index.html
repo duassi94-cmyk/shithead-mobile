@@ -232,6 +232,10 @@
         </div>
       </div>
 
+      <!-- Corpo do jogo: área principal à esquerda + coluna de reações à direita
+           (as reações ficam visíveis mesmo com a mão ampliada) -->
+      <div class="game-body">
+      <div class="game-main">
       <!-- Barra de Sequência de Turnos -->
       <div id="turn-sequence-bar" class="turn-sequence-bar"></div>
 
@@ -268,18 +272,6 @@
           <div id="coach-text" class="coach-text"></div>
           <button id="btn-coach-ok" class="btn btn-success btn-sm">Entendi</button>
         </div>
-      </div>
-
-      <!-- Reações rápidas -->
-      <div class="reaction-bar" id="reaction-bar">
-        <button class="react-btn" data-emoji="👍">👍</button>
-        <button class="react-btn" data-emoji="😂">😂</button>
-        <button class="react-btn" data-emoji="😱">😱</button>
-        <button class="react-btn" data-emoji="😡">😡</button>
-        <button class="react-btn" data-emoji="🔥">🔥</button>
-        <button class="react-btn" data-emoji="💩">💩</button>
-        <button class="react-btn gombra-btn" data-emoji="GOMBRA" disabled>GOMBRA!<span class="gcount"></span></button>
-        <button class="react-btn dormiu-btn" data-emoji="DORMIU" disabled>DORMIU??</button>
       </div>
 
       <!-- Zona do Jogador Local -->
@@ -319,6 +311,21 @@
           <button id="btn-pickup-pile" class="btn btn-danger" style="display:none;">Pegar Monte</button>
           <button id="btn-turbo-big" class="btn turbo-big" style="display:none;">⏩ Só restam bots — acelerar até o fim</button>
         </div>
+      </div>
+
+      </div>
+      <!-- Reações rápidas: coluna na lateral direita -->
+      <div class="reaction-bar" id="reaction-bar">
+        <button class="react-btn" data-emoji="👍">👍</button>
+        <button class="react-btn" data-emoji="😂">😂</button>
+        <button class="react-btn" data-emoji="😱">😱</button>
+        <button class="react-btn" data-emoji="😡">😡</button>
+        <button class="react-btn" data-emoji="🔥">🔥</button>
+        <button class="react-btn" data-emoji="💩">💩</button>
+        <button class="react-btn gombra-btn" data-emoji="GOMBRA" disabled>GOMBRA!<span class="gcount"></span></button>
+        <button class="react-btn dormiu-btn" data-emoji="DORMIU" disabled>DORMIU??</button>
+      </div>
+
       </div>
 
       <!-- Placar da sessão aberto pela mesa (🏆) -->

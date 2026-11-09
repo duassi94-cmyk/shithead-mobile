@@ -2863,7 +2863,9 @@
       const compact = ah < 380 || (opp >= 4 && aw < 520) || (opp >= 3 && aw < 380 && ah < 460);
       oppArea.classList.toggle('seats-compact', compact);
       // Largura de cada assento compacto: cabe exatamente no espaço de cada um
-      oppArea.style.setProperty('--seat-w', compact ? `${Math.max(58, Math.min(76, Math.floor(oppArea.clientWidth / opp) - 4))}px` : '');
+      const seatW = Math.max(48, Math.min(76, Math.floor(oppArea.clientWidth / opp) - 4));
+      oppArea.style.setProperty('--seat-w', compact ? `${seatW}px` : '');
+      oppArea.classList.toggle('seats-tight', compact && seatW < 58); // muitos jogadores em tela estreita
       const positions = seatPositions(opp, compact);
       for (let offset = 1; offset < total; offset++) {
         // Sentido horário na tela: a partir de você (base) → esquerda → topo → direita
@@ -3060,7 +3062,7 @@
         ? `<span class="dock-row">${items.slice(0, perRow).join('')}</span><span class="dock-row">${items.slice(perRow).join('')}</span>`
         : `<span class="dock-row">${items.join('')}</span>`;
       label.innerHTML = me.escaped ? '✔ Escapou'
-        : `${isMyTurn ? '<span class="dock-turn">⚡ Vez</span>' : ''}<span class="dock-n">${n}</span><span class="dock-sub">na mão</span>`;
+        : `${isMyTurn ? '<span class="dock-turn">⚡<span class="dock-turn-txt"> Vez</span></span>' : ''}<span class="dock-n">${n}</span><span class="dock-sub">na mão</span>`;
       dock.title = handOpen ? 'Recolher a mão' : 'Ampliar a mão';
       dock.disabled = n === 0 || hideHand;
       dock.style.visibility = me.escaped && n === 0 ? 'hidden' : 'visible';
